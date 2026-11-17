@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- [INTERNAL] Pull requests are now welcome with a DCO sign-off (`git commit -s`): the organization contributing guide says so, and a new `dco` workflow checks the sign-off on pull requests from outside contributors.
 - [INTERNAL] The licence changes from MIT to Apache-2.0, with a NOTICE file. Releases published before this change keep the MIT licence they shipped with; only new releases carry Apache-2.0.
 - [INTERNAL] The copyright holder in `LICENSE` and the author in `pyproject.toml` are now SureForgeTech; the MIT licence text is unchanged.
 - [INTERNAL] Declare `urllib3>=2.0,<3.0` as a direct dependency: the image-fetch transport uses the urllib3 2.x API (`requests>=2.31` accepts urllib3 2.x).
