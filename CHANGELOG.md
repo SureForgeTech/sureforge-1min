@@ -3,6 +3,7 @@
 ## Unreleased
 
 - [INTERNAL] Pull requests are now welcome with a DCO sign-off (`git commit -s`): the organization contributing guide says so, and a new `dco` workflow checks the sign-off on pull requests from outside contributors.
+- [INTERNAL] The licence changes from MIT to Apache-2.0, with a NOTICE file. Releases published before this change keep the MIT licence they shipped with; only new releases carry Apache-2.0.
 - [INTERNAL] The copyright holder in `LICENSE` and the author in `pyproject.toml` are now SureForgeTech; the MIT licence text is unchanged.
 - [INTERNAL] Declare `urllib3>=2.0,<3.0` as a direct dependency: the image-fetch transport uses the urllib3 2.x API (`requests>=2.31` accepts urllib3 2.x).
 - [SECURITY] Harden the outbound host check for fetched image URLs: any address that is not publicly routable is refused (including the shared address range and IPv6 forms that carry an IPv4 address), every resolved address is checked, a failed lookup refuses the host, image fetches connect only to an address from the same lookup that was checked (TLS still verifies the URL's hostname), URLs with backslashes, whitespace or control characters or with a host the two URL parsers read differently are refused on every redirect hop, image fetches ignore proxy settings from the environment, and a response whose Content-Type is not an image is refused.
