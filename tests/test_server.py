@@ -802,3 +802,118 @@ def test_urllib3_major_version_matches_declared_dependency():
 
     assert int(urllib3.__version__.split(".")[0]) >= 2
     assert server.NameResolutionError is urllib3.exceptions.NameResolutionError
+
+
+class SequenceSession:
+    """Session mock that answers with a canned sequence of responses."""
+
+    def __init__(self, responses: list[Any]) -> None:
+        self.responses = list(responses)
+        self.calls = 0
+
+    def post(self, *args: Any, **kwargs: Any) -> Any:
+        self.calls += 1
+        item = self.responses[min(self.calls - 1, len(self.responses) - 1)]
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+def _chat_body() -> dict[str, Any]:
+    return {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}
+
+
+def _chat_headers() -> dict[str, str]:
+    return {"Authorization": "Bearer fake-key"}
+
+
+def _upstream_reply(text: str = "hi") -> FakeHTTPResponse:
+    return FakeHTTPResponse(
+        text=json.dumps({"aiRecord": {"aiRecordDetail": {"resultObject": text}}})
+    )
+
+
+def test_a_request_the_upstream_declined_is_sent_again(monkeypatch):
+    """A 503 means the request was not handled, so it is sent again."""
+    session = SequenceSession(
+        [FakeHTTPResponse(status_code=503, text="busy"), _upstream_reply()]
+    )
+    monkeypatch.setattr(server, "get_session", lambda: session)
+    monkeypatch.setattr(server.time, "sleep", lambda seconds: None)
+
+    client = server.app.test_client()
+    response = client.post(
+        "/v1/chat/completions", json=_chat_body(), headers=_chat_headers()
+    )
+
+    assert response.status_code == 200
+    assert session.calls == 2
+
+
+def test_a_rate_limited_request_is_sent_again_after_the_retry_after(monkeypatch):
+    """A 429 is retried, and the wait follows the Retry-After header."""
+    session = SequenceSession(
+        [
+            FakeHTTPResponse(
+                status_code=429, text="slow down", headers={"Retry-After": "2"}
+            ),
+            _upstream_reply(),
+        ]
+    )
+    waits: list[float] = []
+    monkeypatch.setattr(server, "get_session", lambda: session)
+    monkeypatch.setattr(server.time, "sleep", waits.append)
+
+    client = server.app.test_client()
+    response = client.post(
+        "/v1/chat/completions", json=_chat_body(), headers=_chat_headers()
+    )
+
+    assert response.status_code == 200
+    assert session.calls == 2
+    assert waits == [2.0]
+
+
+def test_a_rejected_request_is_not_sent_again(monkeypatch):
+    """A request the upstream rejected is not sent again."""
+    session = SequenceSession([FakeHTTPResponse(status_code=400, text="bad request")])
+    monkeypatch.setattr(server, "get_session", lambda: session)
+    monkeypatch.setattr(server.time, "sleep", lambda seconds: None)
+
+    client = server.app.test_client()
+    response = client.post(
+        "/v1/chat/completions", json=_chat_body(), headers=_chat_headers()
+    )
+
+    assert response.status_code == 400
+    assert session.calls == 1
+
+
+def test_a_request_the_upstream_keeps_declining_gives_up(monkeypatch):
+    """The request is sent again a bounded number of times."""
+    session = SequenceSession([FakeHTTPResponse(status_code=503, text="busy")])
+    monkeypatch.setattr(server, "get_session", lambda: session)
+    monkeypatch.setattr(server.time, "sleep", lambda seconds: None)
+
+    client = server.app.test_client()
+    response = client.post(
+        "/v1/chat/completions", json=_chat_body(), headers=_chat_headers()
+    )
+
+    assert response.status_code == 503
+    assert session.calls == server.MAX_UPSTREAM_RETRIES + 1
+
+
+def test_a_request_that_failed_in_the_network_is_not_sent_again(monkeypatch):
+    """A broken connection is not retried: the upstream may have handled it."""
+    session = SequenceSession([server.requests.ConnectionError("connection reset")])
+    monkeypatch.setattr(server, "get_session", lambda: session)
+    monkeypatch.setattr(server.time, "sleep", lambda seconds: None)
+
+    client = server.app.test_client()
+    response = client.post(
+        "/v1/chat/completions", json=_chat_body(), headers=_chat_headers()
+    )
+
+    assert response.status_code == 500
+    assert session.calls == 1

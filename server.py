@@ -160,6 +160,69 @@ def close_session() -> None:
 
 
 # 17. Custom Header Propagation List
+# The upstream statuses that mean the request was not handled and may be sent
+# again. A timeout or a broken connection is not in this list: the upstream may
+# have handled the request, and sending it again could bill the caller twice.
+RETRY_STATUS_CODES = {429, 503}
+# How many times a request that was declined is sent again.
+MAX_UPSTREAM_RETRIES = 2
+# The wait before the first retry; it doubles with every attempt.
+RETRY_BACKOFF_SECONDS = 0.25
+# The longest wait a Retry-After header may ask for.
+MAX_RETRY_AFTER_SECONDS = 5.0
+
+
+def _retry_delay(attempt: int, response: requests.Response | None) -> float:
+    """Return how long to wait before the next attempt.
+
+    Args:
+        attempt: The number of the attempt that just failed, from zero.
+        response: The response that was declined, if there was one.
+
+    Returns:
+        float: The number of seconds to wait.
+    """
+    if response is not None:
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                return min(float(retry_after), MAX_RETRY_AFTER_SECONDS)
+            except ValueError:
+                logger.warning("upstream sent an unreadable Retry-After header")
+    return RETRY_BACKOFF_SECONDS * (2.0**attempt)
+
+
+def post_upstream(label: str, url: str, **kwargs: Any) -> requests.Response:
+    """Send a request to the upstream, retrying one the upstream declined.
+
+    A 429 or 503 means the upstream did not handle the request, so sending it
+    again cannot bill the caller twice. A request that failed in the network
+    is not retried, because the upstream may have handled it.
+
+    Args:
+        label: A short name of the endpoint, used in the log.
+        url: The upstream URL.
+        **kwargs: Passed to the session.
+
+    Returns:
+        requests.Response: The response of the last attempt.
+    """
+    response = get_session().post(url, **kwargs)
+    for attempt in range(MAX_UPSTREAM_RETRIES):
+        if response.status_code not in RETRY_STATUS_CODES:
+            break
+        delay = _retry_delay(attempt, response)
+        logger.warning(
+            "upstream declined the %s request with status %d; retrying in %.2fs",
+            label,
+            response.status_code,
+            delay,
+        )
+        time.sleep(delay)
+        response = get_session().post(url, **kwargs)
+    return response
+
+
 def propagated_headers() -> dict[str, str]:
     """Retrieve propagating headers from current Flask request context.
 
@@ -1182,7 +1245,8 @@ def upload_images(
             return binary_data
 
         # Use connection pool session and propagated headers
-        upload = get_session().post(
+        upload = post_upstream(
+            "asset",
             asset_api_url(),
             files={"asset": (f"gateway-{uuid.uuid4()}.png", binary_data, "image/png")},
             headers={"API-KEY": api_key, **propagated_headers()},
@@ -1366,7 +1430,8 @@ def chat_completions() -> tuple[Response, int] | Response:
     model = data.get("model", config.DEFAULT_CHAT_MODEL)
     if data.get("stream"):
         # Use connection pool session
-        upstream = get_session().post(
+        upstream = post_upstream(
+            "chat",
             chat_stream_api_url(),
             data=json.dumps(payload),
             headers=headers,
@@ -1381,7 +1446,8 @@ def chat_completions() -> tuple[Response, int] | Response:
         )
 
     # Use connection pool session
-    upstream = get_session().post(
+    upstream = post_upstream(
+        "chat",
         chat_api_url(),
         json=payload,
         headers=headers,
@@ -1628,7 +1694,8 @@ def image_generations() -> tuple[Response, int]:
         return error_response("No prompt provided.", 400, "invalid_request_error")
 
     # Use connection pool session and custom header propagation
-    upstream = get_session().post(
+    upstream = post_upstream(
+        "images",
         feature_api_url() + "?isStreaming=false",
         json={
             "type": "IMAGE_GENERATOR",
