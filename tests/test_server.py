@@ -553,6 +553,9 @@ class FakeCatalogSession:
     def get(self, *args: Any, **kwargs: Any) -> FakeHTTPResponse:
         self.calls += 1
         if self.failing:
+            # The failure takes long enough for the callers that are waiting
+            # for the lock to reach it.
+            time.sleep(0.05)
             raise server.requests.ConnectionError("upstream blip")
         return FakeHTTPResponse(text=json.dumps({"models": self.models}))
 
@@ -1023,9 +1026,13 @@ def test_one_slow_feature_does_not_block_another(monkeypatch):
     thread = threading.Thread(target=slow_worker)
     thread.start()
     started.wait()
+    began = time.monotonic()
     assert server.fetch_catalog("FAST") == [{"id": "m"}]
+    elapsed = time.monotonic() - began
     thread.join()
     assert slow == [[{"id": "m"}]]
+    # The fast feature did not wait for the slow one.
+    assert elapsed < 0.25
 
 
 def test_the_catalog_is_asked_again_after_the_backoff(monkeypatch):
@@ -1054,3 +1061,20 @@ def test_a_catalog_ttl_of_zero_still_caches_the_catalog(monkeypatch):
     assert server.fetch_catalog("IMAGE_GENERATOR") == [{"id": "gpt-4o"}]
     assert server.fetch_catalog("IMAGE_GENERATOR") == [{"id": "gpt-4o"}]
     assert session.calls == 1
+
+
+def test_the_image_endpoint_checks_the_prompt_before_the_catalog(monkeypatch):
+    """A request without a prompt is refused even while the catalog is down."""
+    session = FakeCatalogSession()
+    monkeypatch.setattr(server, "get_session", lambda: session)
+    session.failing = True
+
+    client = server.app.test_client()
+    response = client.post(
+        "/v1/images/generations",
+        json={"model": "gpt-image-1"},
+        headers={"Authorization": "Bearer fake-key"},
+    )
+
+    assert response.status_code == 400
+    assert response.json["error"]["message"] == "No prompt provided."

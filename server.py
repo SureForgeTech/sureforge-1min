@@ -297,6 +297,20 @@ def _request_catalog(feature: str) -> tuple[dict[str, Any], ...]:
     return tuple(entry for entry in models if isinstance(entry, dict))
 
 
+def _catalog_retry() -> float:
+    """Return how long a failed fetch is remembered.
+
+    An interval of zero or less means one second, so that the upstream is not
+    asked again for every request.
+
+    Returns:
+        float: The number of seconds.
+    """
+    return float(
+        config.CATALOG_RETRY_SECONDS if config.CATALOG_RETRY_SECONDS > 0 else 1
+    )
+
+
 def _catalog_ttl() -> float:
     """Return how long a fetched catalog is served.
 
@@ -309,11 +323,12 @@ def _catalog_ttl() -> float:
     return float(config.CATALOG_TTL_SECONDS if config.CATALOG_TTL_SECONDS > 0 else 1)
 
 
-def _catalog_copy(state: _CatalogState) -> list[dict[str, Any]] | None:
+def _catalog_copy(state: _CatalogState, feature: str) -> list[dict[str, Any]] | None:
     """Return the catalog that was fetched last, if there is one.
 
     Args:
         state: The cache state of a feature.
+        feature: The feature identifier.
 
     Returns:
         list[dict[str, Any]] | None: The catalog entries, or None when no
@@ -321,7 +336,7 @@ def _catalog_copy(state: _CatalogState) -> list[dict[str, Any]] | None:
     """
     if state.entries is None:
         return None
-    logger.warning("serving the last known model catalog")
+    logger.info("serving the last known model catalog for feature %s", feature)
     return list(state.entries)
 
 
@@ -343,22 +358,22 @@ def fetch_catalog(feature: str) -> list[dict[str, Any]] | None:
     now = time.time()
     if state.entries is not None and now - state.fetched_at < _catalog_ttl():
         return list(state.entries)
-    if state.failed_at and now - state.failed_at < config.CATALOG_RETRY_SECONDS:
+    if state.failed_at and now - state.failed_at < _catalog_retry():
         # A recent attempt failed; the upstream is not asked again yet.
-        return _catalog_copy(state)
+        return _catalog_copy(state, feature)
 
     # Only one thread fetches a feature at a time, so that a burst of
     # requests causes one upstream call. A caller that has a copy to serve
     # does not wait for the fetch that is already running.
     if not state.lock.acquire(blocking=state.entries is None):
-        return _catalog_copy(state)
+        return _catalog_copy(state, feature)
     try:
         now = time.time()
         if state.entries is not None and now - state.fetched_at < _catalog_ttl():
             return list(state.entries)
-        if state.failed_at and now - state.failed_at < config.CATALOG_RETRY_SECONDS:
+        if state.failed_at and now - state.failed_at < _catalog_retry():
             # The attempt that held the lock failed; do not start another one.
-            return _catalog_copy(state)
+            return _catalog_copy(state, feature)
         try:
             entries = _request_catalog(feature)
         except requests.RequestException as exc:
@@ -366,13 +381,13 @@ def fetch_catalog(feature: str) -> list[dict[str, Any]] | None:
             logger.warning(
                 "failed to fetch model catalog for feature %s: %s", feature, exc
             )
-            return _catalog_copy(state)
+            return _catalog_copy(state, feature)
         except ValueError:
             state.failed_at = time.time()
             logger.warning(
                 "failed to parse model catalog response for feature %s", feature
             )
-            return _catalog_copy(state)
+            return _catalog_copy(state, feature)
         state.entries = entries
         state.fetched_at = time.time()
         state.failed_at = 0.0
