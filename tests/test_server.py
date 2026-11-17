@@ -541,13 +541,160 @@ def test_custom_header_propagation(monkeypatch):
     assert "X-Ignored-Header" not in captured_headers
 
 
+class FakeCatalogSession:
+    """Session mock that serves a model catalog, or fails on demand."""
+
+    def __init__(self, models: list[dict[str, Any]] | None = None) -> None:
+        self.models = models if models is not None else []
+        self.failing = False
+        self.calls = 0
+
+    def get(self, *args: Any, **kwargs: Any) -> FakeHTTPResponse:
+        self.calls += 1
+        if self.failing:
+            raise server.requests.ConnectionError("upstream blip")
+        return FakeHTTPResponse(text=json.dumps({"models": self.models}))
+
+
+@pytest.fixture(autouse=True)
+def reset_catalog_state():
+    """Give every test a catalog cache of its own."""
+    states = getattr(server, "_catalog_states", None)
+    if states is not None:
+        states.clear()
+    yield
+    if states is not None:
+        states.clear()
+
+
+def test_catalog_serves_the_last_good_copy_after_an_upstream_failure(monkeypatch):
+    """One upstream blip must not empty the catalog for the whole TTL."""
+    session = FakeCatalogSession([{"id": "gpt-4o"}])
+    monkeypatch.setattr(server, "get_session", lambda: session)
+
+    assert server.fetch_catalog("IMAGE_GENERATOR") == [{"id": "gpt-4o"}]
+
+    session.failing = True
+    server._catalog_state("IMAGE_GENERATOR").fetched_at = 0.0
+
+    assert server.fetch_catalog("IMAGE_GENERATOR") == [{"id": "gpt-4o"}]
+
+
+def test_catalog_is_not_cached_as_empty_after_a_failure(monkeypatch):
+    """A failure is remembered briefly, not for the whole TTL."""
+    session = FakeCatalogSession([{"id": "gpt-4o"}])
+    monkeypatch.setattr(server, "get_session", lambda: session)
+
+    session.failing = True
+    assert server.fetch_catalog("IMAGE_GENERATOR") is None
+
+    # The upstream comes back; the next attempt picks the catalog up again.
+    session.failing = False
+    state = server._catalog_state("IMAGE_GENERATOR")
+    state.failed_at = 0.0
+
+    assert server.fetch_catalog("IMAGE_GENERATOR") == [{"id": "gpt-4o"}]
+
+
+def test_catalog_failure_is_retried_after_a_short_backoff(monkeypatch):
+    """A failing upstream is not asked again for every request."""
+    session = FakeCatalogSession([{"id": "gpt-4o"}])
+    monkeypatch.setattr(server, "get_session", lambda: session)
+
+    session.failing = True
+    assert server.fetch_catalog("IMAGE_GENERATOR") is None
+    assert session.calls == 1
+
+    # Inside the backoff window the upstream is left alone.
+    assert server.fetch_catalog("IMAGE_GENERATOR") is None
+    assert session.calls == 1
+
+
+def test_catalog_fetches_a_feature_once_under_concurrent_requests(monkeypatch):
+    """Concurrent requests for one feature cause one upstream call."""
+    import threading
+
+    session = FakeCatalogSession([{"id": "gpt-4o"}])
+    monkeypatch.setattr(server, "get_session", lambda: session)
+
+    results: list[Any] = []
+    barrier = threading.Barrier(4)
+
+    def worker() -> None:
+        barrier.wait()
+        results.append(server.fetch_catalog("IMAGE_GENERATOR"))
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert session.calls == 1
+    assert results == [[{"id": "gpt-4o"}]] * 4
+
+
+def test_image_generations_reports_an_unavailable_catalog(monkeypatch):
+    """An upstream outage is not reported as an unsupported model."""
+    session = FakeCatalogSession()
+    monkeypatch.setattr(server, "get_session", lambda: session)
+    session.failing = True
+
+    client = server.app.test_client()
+    response = client.post(
+        "/v1/images/generations",
+        json={"model": "gpt-image-1", "prompt": "cat"},
+        headers={"Authorization": "Bearer fake-key"},
+    )
+
+    assert response.status_code == 503
+    assert response.json["error"]["code"] == "catalog_unavailable"
+
+
+def test_models_reports_an_unavailable_catalog(monkeypatch):
+    """The model list reports an unavailable catalog instead of an empty list."""
+    session = FakeCatalogSession()
+    monkeypatch.setattr(server, "get_session", lambda: session)
+    session.failing = True
+
+    client = server.app.test_client()
+    response = client.get("/v1/models")
+
+    assert response.status_code == 503
+    assert response.json["error"]["code"] == "catalog_unavailable"
+
+
+def test_chat_completions_work_while_the_catalog_is_unavailable(monkeypatch):
+    """The catalog only drives a warning on the chat path, never a rejection."""
+
+    class FakeSession:
+        def post(self, *args: Any, **kwargs: Any) -> FakeHTTPResponse:
+            return FakeHTTPResponse(
+                text=json.dumps(
+                    {"aiRecord": {"aiRecordDetail": {"resultObject": "hi"}}}
+                )
+            )
+
+    monkeypatch.setattr(server, "get_session", lambda: FakeSession())
+    monkeypatch.setattr(server, "chat_models", lambda: None)
+
+    client = server.app.test_client()
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]},
+        headers={"Authorization": "Bearer fake-key"},
+    )
+
+    assert response.status_code == 200
+
+
 def test_cache_stampede_protection_lock():
-    """Verify mutex synchronization lock does not interfere with standard fetching."""
-    # Simply prove the lock is available and acquireable
-    assert not server._catalog_mutex.locked()
-    with server._catalog_mutex:
-        assert server._catalog_mutex.locked()
-    assert not server._catalog_mutex.locked()
+    """Verify a feature is fetched by one thread at a time."""
+    state = server._catalog_state("UNIFY_CHAT_WITH_AI")
+    assert not state.lock.locked()
+    with state.lock:
+        assert state.lock.locked()
+    assert not state.lock.locked()
 
 
 @pytest.mark.parametrize(

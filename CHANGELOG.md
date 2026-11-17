@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- [FIX] A failing model catalog no longer empties the model list for the whole cache lifetime: the last catalog that was fetched is served while the upstream is down, a failure is not cached as an empty catalog, one feature is fetched at a time instead of all of them behind one lock, and the model list and image endpoints report an unavailable catalog (503) instead of blaming the caller's model choice (400 `model_not_supported`).
 - [INTERNAL] Pull requests are now welcome with a DCO sign-off (`git commit -s`): the organization contributing guide says so, and a new `dco` workflow checks the sign-off on pull requests from outside contributors.
 - [INTERNAL] The licence changes from MIT to Apache-2.0, with a NOTICE file. Releases published before this change keep the MIT licence they shipped with; only new releases carry Apache-2.0.
 - [INTERNAL] The copyright holder in `LICENSE` and the author in `pyproject.toml` are now SureForgeTech; the MIT licence text is unchanged.

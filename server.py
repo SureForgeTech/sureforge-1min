@@ -3,7 +3,7 @@ from __future__ import annotations
 import atexit
 import base64
 import binascii
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import logging
 import os
@@ -13,7 +13,6 @@ import threading
 import time
 import uuid
 import ipaddress
-from functools import lru_cache
 from importlib import metadata
 from io import BytesIO
 from typing import Any, Generator
@@ -234,78 +233,139 @@ def gateway_version() -> str:
         return "0.1.1"
 
 
-def cache_bucket() -> int:
-    """Generate cache bucket key based on the TTL configuration.
+# How long a failed catalog fetch is remembered before the upstream is asked
+# again. A blip must not empty the catalog for the whole TTL.
+CATALOG_RETRY_SECONDS = 10
 
-    Returns:
-        int: Time-based bucket identifier.
+
+@dataclass
+class _CatalogState:
+    """The last known model catalog of one feature.
+
+    A copy of the catalog that was fetched successfully is kept, so that a
+    failing upstream does not empty the catalog. The failure is remembered for
+    a short while, so that a burst of requests does not hammer the upstream.
     """
-    return (
-        int(time.time() // config.CATALOG_TTL_SECONDS)
-        if config.CATALOG_TTL_SECONDS > 0
-        else int(time.time())
-    )
+
+    entries: tuple[dict[str, Any], ...] = ()
+    fetched_at: float = 0.0
+    failed_at: float = 0.0
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
 
-# 4. Cache Stampede Protection (Mutex Locking)
-_catalog_mutex = threading.Lock()
+_catalog_states: dict[str, _CatalogState] = {}
+_catalog_states_lock = threading.Lock()
 
 
-@lru_cache(maxsize=32)
-def fetch_catalog_cached(feature: str, _bucket: int) -> tuple[dict[str, Any], ...]:
-    """Fetch model catalog with TTL caching and Cache Stampede protection.
-
-    Args:
-        feature: The model feature identifier.
-        _bucket: The current cache bucket ID.
-
-    Returns:
-        tuple[dict[str, Any], ...]: The models entries catalog.
-    """
-    with _catalog_mutex:
-        try:
-            response = get_session().get(
-                model_api_url(),
-                params={"feature": feature},
-                timeout=30,
-                verify=config.GATEWAY_VERIFY_SSL,
-            )
-            response.raise_for_status()
-            data = response.json()
-        except requests.RequestException as exc:
-            logger.warning(
-                "failed to fetch model catalog for feature %s: %s", feature, exc
-            )
-            return tuple()
-        except ValueError:
-            logger.warning(
-                "failed to parse model catalog response for feature %s", feature
-            )
-            return tuple()
-
-        models = data.get("models") if isinstance(data, dict) else []
-        if not isinstance(models, list):
-            models = []
-        return tuple(entry for entry in models if isinstance(entry, dict))
-
-
-def fetch_catalog(feature: str) -> list[dict[str, Any]]:
-    """Fetch catalog for a given feature using active cache bucket.
+def _catalog_state(feature: str) -> _CatalogState:
+    """Return the cache state of one feature, creating it when needed.
 
     Args:
         feature: The feature identifier.
 
     Returns:
-        list[dict[str, Any]]: List of matching models.
+        _CatalogState: The cache state of the feature.
     """
-    return list(fetch_catalog_cached(feature, cache_bucket()))
+    with _catalog_states_lock:
+        state = _catalog_states.get(feature)
+        if state is None:
+            state = _CatalogState()
+            _catalog_states[feature] = state
+        return state
 
 
-def chat_models() -> list[dict[str, Any]]:
+def _request_catalog(feature: str) -> tuple[dict[str, Any], ...]:
+    """Ask the upstream for the model catalog of one feature.
+
+    Args:
+        feature: The feature identifier.
+
+    Returns:
+        tuple[dict[str, Any], ...]: The catalog entries.
+    """
+    response = get_session().get(
+        model_api_url(),
+        params={"feature": feature},
+        timeout=30,
+        verify=config.GATEWAY_VERIFY_SSL,
+    )
+    response.raise_for_status()
+    data = response.json()
+    models = data.get("models") if isinstance(data, dict) else []
+    if not isinstance(models, list):
+        models = []
+    return tuple(entry for entry in models if isinstance(entry, dict))
+
+
+def fetch_catalog(feature: str) -> list[dict[str, Any]] | None:
+    """Fetch the catalog of one feature.
+
+    The last catalog that was fetched successfully is served when the upstream
+    fails, so that one blip does not empty the catalog for the whole TTL. A
+    failure is never cached as an empty catalog.
+
+    Args:
+        feature: The feature identifier.
+
+    Returns:
+        list[dict[str, Any]] | None: The catalog entries, or None when the
+        catalog is unavailable and no good copy was ever fetched.
+    """
+    state = _catalog_state(feature)
+    now = time.time()
+    if state.entries and now - state.fetched_at < config.CATALOG_TTL_SECONDS:
+        return list(state.entries)
+    if state.failed_at and now - state.failed_at < CATALOG_RETRY_SECONDS:
+        # A recent attempt failed; the upstream is not asked again yet.
+        return list(state.entries) if state.entries else None
+
+    # Only one thread fetches a feature at a time, so that a burst of
+    # requests causes one upstream call. A caller that has a copy to serve
+    # does not wait for the fetch that is already running.
+    if not state.lock.acquire(blocking=not state.entries):
+        return list(state.entries)
+    try:
+        now = time.time()
+        if state.entries and now - state.fetched_at < config.CATALOG_TTL_SECONDS:
+            return list(state.entries)
+        try:
+            entries = _request_catalog(feature)
+        except requests.RequestException as exc:
+            state.failed_at = time.time()
+            logger.warning(
+                "failed to fetch model catalog for feature %s: %s", feature, exc
+            )
+            if state.entries:
+                logger.warning(
+                    "serving the last known model catalog for feature %s", feature
+                )
+                return list(state.entries)
+            return None
+        except ValueError:
+            state.failed_at = time.time()
+            logger.warning(
+                "failed to parse model catalog response for feature %s", feature
+            )
+            if state.entries:
+                logger.warning(
+                    "serving the last known model catalog for feature %s", feature
+                )
+                return list(state.entries)
+            return None
+        state.entries = entries
+        state.fetched_at = time.time()
+        state.failed_at = 0.0
+        return list(entries)
+    finally:
+        state.lock.release()
+
+
+def chat_models() -> list[dict[str, Any]] | None:
     """Fetch chat models from the model catalog.
 
     Returns:
-        list[dict[str, Any]]: List of chat models.
+        list[dict[str, Any]] | None: List of chat models, or None when the
+        catalog is unavailable.
     """
     return fetch_catalog("UNIFY_CHAT_WITH_AI")
 
@@ -327,38 +387,30 @@ def model_id(entry: dict[str, Any]) -> str:
 
 
 # 7. Vision and Image Model ID Sets Cache Optimization (frozenset)
-@lru_cache(maxsize=32)
-def vision_model_ids_cached(_bucket: int) -> frozenset[str]:
-    """Retrieve and cache vision model IDs for the active cache bucket."""
-    return frozenset(
-        model_id(entry) for entry in fetch_catalog("CHAT_WITH_IMAGE") if model_id(entry)
-    )
-
-
-def vision_model_ids() -> frozenset[str]:
-    """Retrieve current set of vision model IDs.
+def vision_model_ids() -> frozenset[str] | None:
+    """Retrieve the current set of vision model IDs.
 
     Returns:
-        frozenset[str]: Set of model IDs supporting image inputs.
+        frozenset[str] | None: Set of model IDs supporting image inputs, or
+        None when the catalog is unavailable.
     """
-    return vision_model_ids_cached(cache_bucket())
+    catalog = fetch_catalog("CHAT_WITH_IMAGE")
+    if catalog is None:
+        return None
+    return frozenset(model_id(entry) for entry in catalog if model_id(entry))
 
 
-@lru_cache(maxsize=32)
-def image_model_ids_cached(_bucket: int) -> frozenset[str]:
-    """Retrieve and cache image generator model IDs for the active cache bucket."""
-    return frozenset(
-        model_id(entry) for entry in fetch_catalog("IMAGE_GENERATOR") if model_id(entry)
-    )
-
-
-def image_model_ids() -> frozenset[str]:
-    """Retrieve current set of image model IDs.
+def image_model_ids() -> frozenset[str] | None:
+    """Retrieve the current set of image model IDs.
 
     Returns:
-        frozenset[str]: Set of model IDs supporting image generation.
+        frozenset[str] | None: Set of model IDs supporting image generation,
+        or None when the catalog is unavailable.
     """
-    return image_model_ids_cached(cache_bucket())
+    catalog = fetch_catalog("IMAGE_GENERATOR")
+    if catalog is None:
+        return None
+    return frozenset(model_id(entry) for entry in catalog if model_id(entry))
 
 
 def error_response(
@@ -1165,7 +1217,14 @@ def upload_images(
     """
     if not image_urls:
         return []
-    if model not in vision_model_ids():
+    vision_ids = vision_model_ids()
+    if vision_ids is None:
+        return error_response(
+            "The model catalog is temporarily unavailable.",
+            503,
+            "catalog_unavailable",
+        )
+    if model not in vision_ids:
         return error_response(
             f"This model does not support image inputs: {model}",
             400,
@@ -1221,7 +1280,10 @@ def build_payload(
     model = data.get("model", config.DEFAULT_CHAT_MODEL)
 
     # 19. Enhanced Model Warning Traces
-    if model not in {model_id(m) for m in chat_models() if model_id(m)}:
+    catalog = chat_models()
+    if catalog is not None and model not in {
+        model_id(m) for m in catalog if model_id(m)
+    }:
         logger.warning(
             "Requested model '%s' is not listed in active models catalog.", model
         )
@@ -1316,6 +1378,13 @@ def models() -> tuple[Response, int]:
     Returns:
         tuple[Response, int]: OpenAI-compatible model listing.
     """
+    catalog = chat_models()
+    if catalog is None:
+        return error_response(
+            "The model catalog is temporarily unavailable.",
+            503,
+            "catalog_unavailable",
+        )
     return jsonify(
         {
             "object": "list",
@@ -1326,7 +1395,7 @@ def models() -> tuple[Response, int]:
                     "created": 1727389042,
                     "owned_by": "1minai",
                 }
-                for entry in chat_models()
+                for entry in catalog
                 if model_id(entry)
             ],
         }
@@ -1616,7 +1685,14 @@ def image_generations() -> tuple[Response, int]:
     if isinstance(data, tuple):
         return data
     model = data.get("model", config.DEFAULT_IMAGE_MODEL)
-    if model not in image_model_ids():
+    image_ids = image_model_ids()
+    if image_ids is None:
+        return error_response(
+            "The model catalog is temporarily unavailable.",
+            503,
+            "catalog_unavailable",
+        )
+    if model not in image_ids:
         return error_response(
             f"This model does not support image generation: {model}",
             400,
