@@ -39,7 +39,7 @@ from flask import (
     g,
     has_request_context,
 )
-from werkzeug.exceptions import BadRequest, HTTPException
+from werkzeug.exceptions import BadRequest, HTTPException, RequestEntityTooLarge
 from werkzeug.http import HTTP_STATUS_CODES
 from waitress import serve
 
@@ -63,6 +63,7 @@ class GatewayConfig:
     )
     CATALOG_TTL_SECONDS: int = int(os.getenv("CATALOG_TTL_SECONDS", "300"))
     MAX_IMAGE_BYTES: int = int(os.getenv("MAX_IMAGE_BYTES", str(10 * 1024 * 1024)))
+    MAX_REQUEST_BYTES: int = int(os.getenv("MAX_REQUEST_BYTES", str(16 * 1024 * 1024)))
     CORS_ALLOW_ORIGIN: str = os.getenv("CORS_ALLOW_ORIGIN", "*")
     PORT: int = 5001
     HOST: str = os.getenv("HOST", "0.0.0.0")
@@ -1089,6 +1090,10 @@ def decode_data_image(image_url: str) -> BytesIO | tuple[Response, int]:
         encoded = image_url.split(",", 1)[1]
     except IndexError:
         return error_response("Invalid image data URL.", 400, "invalid_image")
+    # The encoded text is measured before it is decoded, so an oversized
+    # payload is never turned into bytes in memory.
+    if len(encoded) > 4 * ((config.MAX_IMAGE_BYTES + 2) // 3):
+        return error_response("Image payload is too large.", 413, "image_too_large")
     try:
         payload = base64.b64decode(encoded, validate=True)
     except (binascii.Error, ValueError):
@@ -1673,6 +1678,9 @@ def create_app() -> Flask:
     """
     app = Flask(__name__)
     app.url_map.strict_slashes = False
+    # Reject a body that is larger than the gateway accepts, instead of
+    # reading it into memory.
+    app.config["MAX_CONTENT_LENGTH"] = config.MAX_REQUEST_BYTES
 
     # 11. Relocate global logging initialization inside create_app
     configure_logging()
@@ -1715,6 +1723,25 @@ def create_app() -> Flask:
         return response
 
     # 5. Global Exception JSON Error Handler
+    @app.errorhandler(RequestEntityTooLarge)
+    def handle_request_too_large(exc: RequestEntityTooLarge) -> tuple[Response, int]:
+        """Answer a request body that is larger than the gateway accepts.
+
+        Args:
+            exc: The exception raised by the request parser.
+
+        Returns:
+            tuple[Response, int]: The OpenAI-shaped error response.
+        """
+        logger.warning(
+            "rejected a request body larger than %d bytes", config.MAX_REQUEST_BYTES
+        )
+        return error_response(
+            f"The request body is larger than {config.MAX_REQUEST_BYTES} bytes.",
+            413,
+            "request_too_large",
+        )
+
     @app.errorhandler(Exception)
     def handle_exception(exc: Exception) -> tuple[Response, int]:
         logger.exception("Unhandled error occurred in gateway: %s", exc)
@@ -1741,7 +1768,13 @@ def main() -> None:
     logger.info(
         "one-min-ai-gateway starting on %s:%s via CLI", config.HOST, config.PORT
     )
-    serve(app, host=config.HOST, port=config.PORT, threads=config.WAITRESS_THREADS)
+    serve(
+        app,
+        host=config.HOST,
+        port=config.PORT,
+        threads=config.WAITRESS_THREADS,
+        max_request_body_size=config.MAX_REQUEST_BYTES,
+    )
 
 
 if __name__ == "__main__":

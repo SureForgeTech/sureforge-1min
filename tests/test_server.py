@@ -1,3 +1,4 @@
+import base64
 import json
 from typing import Any, Generator
 import pytest
@@ -802,3 +803,83 @@ def test_urllib3_major_version_matches_declared_dependency():
 
     assert int(urllib3.__version__.split(".")[0]) >= 2
     assert server.NameResolutionError is urllib3.exceptions.NameResolutionError
+
+
+def test_oversized_request_body_returns_413(monkeypatch):
+    """A request body over the limit is refused instead of being read."""
+    monkeypatch.setattr(server.config, "MAX_REQUEST_BYTES", 1024)
+    app = server.create_app()
+    client = app.test_client()
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "x" * 8192}],
+        },
+        headers={"Authorization": "Bearer fake-key"},
+    )
+
+    assert response.status_code == 413
+    assert response.json["error"]["code"] == "request_too_large"
+    assert response.json["error"]["type"] == "invalid_request_error"
+
+
+def test_request_body_within_the_limit_is_accepted(monkeypatch):
+    """A body under the limit is still read and handled."""
+    monkeypatch.setattr(server.config, "MAX_REQUEST_BYTES", 1024 * 1024)
+
+    class FakeSession:
+        def post(self, *args: Any, **kwargs: Any) -> FakeHTTPResponse:
+            return FakeHTTPResponse(
+                text=json.dumps(
+                    {"aiRecord": {"aiRecordDetail": {"resultObject": "hi"}}}
+                )
+            )
+
+    monkeypatch.setattr(server, "get_session", lambda: FakeSession())
+    app = server.create_app()
+    client = app.test_client()
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]},
+        headers={"Authorization": "Bearer fake-key"},
+    )
+
+    assert response.status_code == 200
+
+
+def test_oversized_data_image_is_rejected_before_it_is_decoded(monkeypatch):
+    """An oversized inline image is refused without being decoded."""
+    monkeypatch.setattr(server.config, "MAX_IMAGE_BYTES", 16)
+    encoded = base64.b64encode(b"x" * 100).decode()
+
+    def fail(*args: Any, **kwargs: Any) -> bytes:
+        raise AssertionError("the payload must not be decoded")
+
+    monkeypatch.setattr(server.base64, "b64decode", fail)
+
+    with server.app.app_context():
+        result = server.decode_data_image(f"data:image/png;base64,{encoded}")
+
+    assert isinstance(result, tuple)
+    assert result[1] == 413
+
+
+def test_the_body_limit_is_configured_on_the_application():
+    """Flask is told the same limit the gateway advertises."""
+    assert server.app.config["MAX_CONTENT_LENGTH"] == server.config.MAX_REQUEST_BYTES
+
+
+def test_main_passes_the_body_limit_to_waitress(monkeypatch):
+    """Waitress refuses a body over the limit before it reaches the app."""
+    captured: dict[str, Any] = {}
+
+    def fake_serve(app: Any, **kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr(server, "serve", fake_serve)
+    server.main()
+
+    assert captured["max_request_body_size"] == server.config.MAX_REQUEST_BYTES
