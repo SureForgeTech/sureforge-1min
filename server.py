@@ -622,9 +622,10 @@ def parse_tool_text(text: str, tools: list[dict[str, Any]]) -> dict[str, Any] | 
 CRAWL_MARKER = "🌐 Crawling site "
 
 # The most text held back while it is still undecided whether the current line
-# is a crawl-status line. A crawl-status line is short, so a longer run of text
-# is streamed instead of buffered.
-CRAWL_HOLDBACK_MAX = 200
+# is a crawl-status line. The holdback is what lets the filter see the marker
+# after any leading space, so it is generous; a crawl-status line with more
+# leading space than this is let through rather than held.
+CRAWL_HOLDBACK_MAX = 4096
 
 
 def clean_text(text: str) -> str:
@@ -1719,8 +1720,13 @@ def _stream_body(
                     at_line_start = True
 
                 if dropping_line:
-                    # The crawl-status line continues; its text is dropped.
-                    buffered_text = ""
+                    # The crawl-status line continues and its text is dropped.
+                    # The last part of it is kept, so that a tool call on the
+                    # same line is still detected instead of vanishing with the
+                    # line.
+                    if len(buffered_text) > tail_size:
+                        buffered_text = buffered_text[-tail_size:]
+                        at_line_start = False
                 else:
                     keep = tail_size
                     if at_line_start:
@@ -1728,15 +1734,11 @@ def _stream_body(
                         if decision == "crawl":
                             # The line is a crawl-status line: drop it.
                             dropping_line = True
-                            buffered_text = ""
+                            keep = len(buffered_text)
                         elif decision == "undecided":
-                            # The line may still become a crawl-status
-                            # line, so hold it back, within the cap that
-                            # keeps the buffer bounded.
-                            keep = max(
-                                tail_size,
-                                min(len(buffered_text), CRAWL_HOLDBACK_MAX),
-                            )
+                            # The line may still become a crawl-status line, so
+                            # hold it back. The cap keeps the buffer bounded.
+                            keep = min(len(buffered_text), CRAWL_HOLDBACK_MAX)
                     if len(buffered_text) > keep:
                         cut = len(buffered_text) - keep
                         chunk = emit_content_chunk(buffered_text[:cut])

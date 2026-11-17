@@ -965,6 +965,35 @@ def test_stream_response_keeps_content_when_crawl_marker_is_mid_line():
     assert received == text
 
 
+def test_stream_response_keeps_a_tool_call_on_a_crawl_status_line():
+    """A tool call is delivered even when it shares a line with a status line."""
+    text = (
+        "\U0001f310 Crawling site https://x"
+        '<tool_call>{"name":"glob","arguments":{"pattern":"*"}}</tool_call>'
+    )
+
+    class FakeResponse:
+        def iter_lines(self, decode_unicode=False):
+            return [
+                f"data: {json.dumps({'delta': {'content': text[i : i + 1]}})}".encode(
+                    "utf-8"
+                )
+                for i in range(0, len(text))
+            ]
+
+        def close(self):
+            pass
+
+    chunks = list(
+        server.stream_response(
+            FakeResponse(), {"tools": [{"function": {"name": "glob"}}]}, "m"
+        )
+    )
+    assert any("tool_calls" in chunk for chunk in chunks)
+    # The crawl-status text is still not sent to the client.
+    assert not any("Crawling" in chunk for chunk in chunks)
+
+
 def test_stream_response_streams_a_long_line_incrementally():
     """A long line without a newline is streamed instead of buffered whole."""
     chunk = " " * 50
