@@ -619,8 +619,15 @@ def parse_tool_text(text: str, tools: list[dict[str, Any]]) -> dict[str, Any] | 
     return None
 
 
+CRAWL_MARKER = "🌐 Crawling site "
+
+
 def clean_text(text: str) -> str:
     """Clean specific crawl status lines from output text.
+
+    This is the whole-text path, used where the complete response is
+    available. The streaming path filters at line boundaries instead and
+    keeps the text byte for byte.
 
     Args:
         text: The text to clean.
@@ -629,11 +636,60 @@ def clean_text(text: str) -> str:
         str: Cleaned text content.
     """
     lines = [
-        line
-        for line in text.splitlines()
-        if not line.strip().startswith("🌐 Crawling site ")
+        line for line in text.splitlines() if not line.strip().startswith(CRAWL_MARKER)
     ]
     return "\n".join(lines).strip()
+
+
+def _is_crawl_line(line: str) -> bool:
+    """Return True when a line is a crawl-status line that must be dropped."""
+    return line.strip().startswith(CRAWL_MARKER)
+
+
+def _split_complete_lines(text: str) -> tuple[str, str]:
+    """Split text at its last newline.
+
+    Only "\n" separates lines, so a byte that ``str.splitlines`` would treat
+    as a line break stays inside the text instead of being rewritten.
+
+    Returns:
+        tuple[str, str]: The complete lines including their terminator, and
+        the trailing partial line.
+    """
+    cut = text.rfind("\n")
+    if cut == -1:
+        return "", text
+    return text[: cut + 1], text[cut + 1 :]
+
+
+def _drop_crawl_lines(text: str) -> str:
+    """Drop crawl-status lines from complete lines, keeping every other byte."""
+    kept: list[str] = []
+    start = 0
+    while True:
+        end = text.find("\n", start)
+        if end == -1:
+            break
+        line = text[start : end + 1]
+        if not _is_crawl_line(line):
+            kept.append(line)
+        start = end + 1
+    return "".join(kept)
+
+
+def _crawl_holdback(text: str) -> int:
+    """Number of trailing characters that may still become a crawl-status line.
+
+    While the partial line matches a prefix of the crawl marker the rest of
+    the line is unknown, so the whole partial line is held back. As soon as it
+    diverges from the marker it can never become one and is safe to emit.
+    """
+    stripped = text.lstrip()
+    if not stripped:
+        return len(text)
+    if stripped.startswith(CRAWL_MARKER) or CRAWL_MARKER.startswith(stripped):
+        return len(text)
+    return 0
 
 
 def tool_message(tool_call: dict[str, Any]) -> dict[str, Any]:
@@ -1438,6 +1494,16 @@ def stream_response(
     Yields:
         Generator[str, None, None]: Server-Sent Event chunk sequences.
     """
+    try:
+        yield from _stream_response(upstream, data, model)
+    finally:
+        upstream.close()
+
+
+def _stream_response(
+    upstream: requests.Response, data: dict[str, Any], model: str
+) -> Generator[str, None, None]:
+    """Stream the upstream response, closing it when the consumer stops."""
     buffered_text = ""
     tail_size = 200
     current_event = None
@@ -1562,18 +1628,26 @@ def stream_response(
                     in_tool_buffering = False
 
             if not in_tool_buffering:
-                if len(buffered_text) > tail_size:
-                    flush = buffered_text[:-tail_size]
-                    if flush:
-                        cleaned = clean_text(flush)
+                complete, partial = _split_complete_lines(buffered_text)
+                if complete:
+                    buffered_text = partial
+                    cleaned = _drop_crawl_lines(complete)
+                    if cleaned:
                         chunk = emit_content_chunk(cleaned)
                         if chunk:
                             yield chunk
-                    buffered_text = buffered_text[-tail_size:]
+                if (
+                    len(buffered_text) > tail_size
+                    and _crawl_holdback(buffered_text) == 0
+                ):
+                    cut = len(buffered_text) - tail_size
+                    chunk = emit_content_chunk(buffered_text[:cut])
+                    if chunk:
+                        yield chunk
+                    buffered_text = buffered_text[cut:]
 
-    text = clean_text(buffered_text)
-    if text:
-        chunk = emit_content_chunk(text)
+    if buffered_text and not _is_crawl_line(buffered_text):
+        chunk = emit_content_chunk(buffered_text)
         if chunk:
             yield chunk
 
