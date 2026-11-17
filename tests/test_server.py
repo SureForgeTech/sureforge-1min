@@ -468,9 +468,8 @@ def test_vision_flexible_payload_formats():
     assert imgs == ["https://example.com/img2.png"]
 
 
-def test_tiktoken_accurate_counting(monkeypatch):
-    """Verify that token_count handles tiktoken encoding safely or falls back."""
-    # If tiktoken is loaded, it should count accurately
+def test_token_count_is_positive():
+    """Verify that a token count is never zero."""
     cnt = server.token_count("Hello world! How are you?")
     assert cnt > 0
 
@@ -802,3 +801,83 @@ def test_urllib3_major_version_matches_declared_dependency():
 
     assert int(urllib3.__version__.split(".")[0]) >= 2
     assert server.NameResolutionError is urllib3.exceptions.NameResolutionError
+
+
+class StreamingSession:
+    """Session mock that streams a canned answer and serves a catalog."""
+
+    def __init__(self, content: str) -> None:
+        self.content = content
+
+    def get(self, *args: Any, **kwargs: Any) -> FakeHTTPResponse:
+        return FakeHTTPResponse(text=json.dumps({"models": [{"id": "gpt-4o"}]}))
+
+    def post(self, *args: Any, **kwargs: Any) -> Any:
+        payload = json.dumps({"delta": {"content": self.content}})
+        response = FakeHTTPResponse(text="")
+        response.status_code = 200
+        response.iter_lines = lambda decode_unicode=False: [
+            f"data: {payload}".encode("utf-8")
+        ]
+        return response
+
+
+def _stream_request() -> dict[str, Any]:
+    return {
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": True,
+    }
+
+
+def test_a_stream_reports_the_usage_when_the_caller_asks_for_it(monkeypatch):
+    """A stream that was asked for carries the token counts."""
+    monkeypatch.setattr(server, "get_session", lambda: StreamingSession("hello world"))
+    client = server.app.test_client()
+
+    body = client.post(
+        "/v1/chat/completions",
+        json={**_stream_request(), "stream_options": {"include_usage": True}},
+        headers={"Authorization": "Bearer fake-key"},
+    ).get_data(as_text=True)
+
+    assert '"usage"' in body
+    usage = json.loads(
+        [line for line in body.split("\n\n") if '"usage"' in line][0][len("data: ") :]
+    )["usage"]
+    assert usage["prompt_tokens"] > 0
+    assert usage["completion_tokens"] > 0
+    assert usage["total_tokens"] == (
+        usage["prompt_tokens"] + usage["completion_tokens"]
+    )
+
+
+def test_a_stream_has_no_usage_chunk_by_default(monkeypatch):
+    """A stream that was not asked for carries no usage."""
+    monkeypatch.setattr(server, "get_session", lambda: StreamingSession("hello world"))
+    client = server.app.test_client()
+
+    body = client.post(
+        "/v1/chat/completions",
+        json=_stream_request(),
+        headers={"Authorization": "Bearer fake-key"},
+    ).get_data(as_text=True)
+
+    assert '"usage"' not in body
+
+
+def test_the_token_count_counts_words_and_marks():
+    """The token count is a word, a number or a mark of punctuation each."""
+    assert server.token_count("one two three") == 3
+    assert server.token_count("Hello world! How are you?") == 7
+    assert server.token_count("") == 1
+
+
+def test_the_token_count_does_not_depend_on_where_the_text_was_split():
+    """A word split over two pieces is still one token."""
+    whole = server._TokenCounter()
+    whole.add("hello world")
+    split = server._TokenCounter()
+    split.add("hello wo")
+    split.add("rld")
+    assert whole.total() == split.total()
