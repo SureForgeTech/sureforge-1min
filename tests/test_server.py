@@ -911,12 +911,84 @@ def test_stream_response_closes_upstream_on_tool_call_exit():
             self.closed = True
 
     upstream = FakeResponse()
-    list(
-        server.stream_response(
-            upstream, {"tools": [{"function": {"name": "glob"}}]}, "m"
-        )
+    stream = server.stream_response(
+        upstream, {"tools": [{"function": {"name": "glob"}}]}, "m"
     )
+    events = []
+    for event in stream:
+        events.append(event)
+        if event == "data: [DONE]\n\n":
+            # The gateway stops reading the upstream at the tool call, so the
+            # response is released before the done marker is sent.
+            assert upstream.closed is True
+            break
+    assert any("tool_calls" in event for event in events)
+
+
+def test_stream_response_closes_upstream_before_the_first_chunk():
+    """The upstream response is closed even when the stream is closed unread."""
+
+    class FakeResponse:
+        def __init__(self):
+            self.closed = False
+
+        def iter_lines(self, decode_unicode=False):
+            yield b'data: {"delta":{"content":"never read"}}'
+
+        def close(self):
+            self.closed = True
+
+    upstream = FakeResponse()
+    stream = server.stream_response(upstream, {}, "m")
+    stream.close()
     assert upstream.closed is True
+
+
+def test_stream_response_keeps_content_when_crawl_marker_is_mid_line():
+    """A crawl marker in the middle of a line is ordinary text, not a status line."""
+    marker = "\U0001f310 Crawling site "
+    text = "A" * 100 + marker + "https://example.com/" + "B" * 400
+
+    class FakeResponse:
+        def iter_lines(self, decode_unicode=False):
+            return [
+                f"data: {json.dumps({'delta': {'content': text[i : i + 4]}})}".encode(
+                    "utf-8"
+                )
+                for i in range(0, len(text), 4)
+            ]
+
+        def close(self):
+            pass
+
+    received = _streamed_content(server.stream_response(FakeResponse(), {}, "m"))
+    assert received == text
+
+
+def test_stream_response_streams_a_long_line_incrementally():
+    """A long line without a newline is streamed instead of buffered whole."""
+    chunk = " " * 50
+    total = 400
+
+    class FakeResponse:
+        def iter_lines(self, decode_unicode=False):
+            return [
+                f"data: {json.dumps({'delta': {'content': chunk}})}".encode("utf-8")
+                for _ in range(total)
+            ]
+
+        def close(self):
+            pass
+
+    parts = []
+    for event in server.stream_response(FakeResponse(), {}, "m"):
+        if event.startswith("data: ") and not event.startswith("data: [DONE]"):
+            body = json.loads(event[len("data: ") :].strip())
+            content = body["choices"][0].get("delta", {}).get("content") or ""
+            if content:
+                parts.append(content)
+    assert len(parts) > 1
+    assert "".join(parts) == chunk * total
 
 
 def test_stream_response_closes_upstream_when_consumer_stops():
