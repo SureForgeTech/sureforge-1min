@@ -34,6 +34,7 @@ Useful environment variables:
 - `PORT`: listen port inside the container, default `5001`
 - `HOST`: listen host, default `0.0.0.0`
 - `CATALOG_TTL_SECONDS`: model catalog cache TTL in seconds, default `300`
+- `CATALOG_RETRY_SECONDS`: how long a failed model catalog fetch is remembered before the upstream is asked again, default `10`
 - `MAX_IMAGE_BYTES`: maximum image upload/fetch payload in bytes, default `10485760` (10 MB)
 - `CORS_ALLOW_ORIGIN`: CORS origin value, default `*`
 - `DEFAULT_CHAT_MODEL`: default fallback chat model, default `gpt-4o`

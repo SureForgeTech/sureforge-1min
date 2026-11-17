@@ -1,4 +1,5 @@
 import json
+import time
 from typing import Any, Generator
 import pytest
 import server
@@ -558,7 +559,12 @@ class FakeCatalogSession:
 
 @pytest.fixture(autouse=True)
 def reset_catalog_state():
-    """Give every test a catalog cache of its own."""
+    """Give every test a catalog cache of its own.
+
+    The cache is looked up defensively, so that this test file can also be
+    run against a `server.py` that has no catalog cache, to see which of the
+    tests the change makes fail.
+    """
     states = getattr(server, "_catalog_states", None)
     if states is not None:
         states.clear()
@@ -949,3 +955,102 @@ def test_urllib3_major_version_matches_declared_dependency():
 
     assert int(urllib3.__version__.split(".")[0]) >= 2
     assert server.NameResolutionError is urllib3.exceptions.NameResolutionError
+
+
+def test_an_empty_catalog_that_was_fetched_is_cached(monkeypatch):
+    """An upstream that answers without models is not asked for every request."""
+    session = FakeCatalogSession([])
+    monkeypatch.setattr(server, "get_session", lambda: session)
+
+    assert server.fetch_catalog("IMAGE_GENERATOR") == []
+    for _ in range(5):
+        assert server.fetch_catalog("IMAGE_GENERATOR") == []
+    assert session.calls == 1
+
+
+def test_a_failing_upstream_is_asked_once_for_a_burst_of_requests(monkeypatch):
+    """A burst against a failing upstream causes one upstream call."""
+    import threading
+
+    session = FakeCatalogSession([])
+    monkeypatch.setattr(server, "get_session", lambda: session)
+    session.failing = True
+
+    results: list[Any] = []
+    barrier = threading.Barrier(8)
+
+    def worker() -> None:
+        barrier.wait()
+        results.append(server.fetch_catalog("IMAGE_GENERATOR"))
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert session.calls == 1
+    assert results == [None] * 8
+
+
+def test_one_slow_feature_does_not_block_another(monkeypatch):
+    """A feature that is slow to fetch does not hold up the other features."""
+    import threading
+
+    class SlowSession:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def get(self, *args: Any, **kwargs: Any) -> FakeHTTPResponse:
+            self.calls += 1
+            feature = kwargs.get("params", {}).get("feature")
+            if feature == "SLOW":
+                import time as time_module
+
+                time_module.sleep(0.5)
+            return FakeHTTPResponse(text=json.dumps({"models": [{"id": "m"}]}))
+
+    session = SlowSession()
+    monkeypatch.setattr(server, "get_session", lambda: session)
+
+    slow: list[Any] = []
+    started = threading.Event()
+
+    def slow_worker() -> None:
+        started.set()
+        slow.append(server.fetch_catalog("SLOW"))
+
+    thread = threading.Thread(target=slow_worker)
+    thread.start()
+    started.wait()
+    assert server.fetch_catalog("FAST") == [{"id": "m"}]
+    thread.join()
+    assert slow == [[{"id": "m"}]]
+
+
+def test_the_catalog_is_asked_again_after_the_backoff(monkeypatch):
+    """A failed attempt is tried again once the backoff has passed."""
+    session = FakeCatalogSession([{"id": "gpt-4o"}])
+    monkeypatch.setattr(server, "get_session", lambda: session)
+
+    session.failing = True
+    assert server.fetch_catalog("IMAGE_GENERATOR") is None
+    assert session.calls == 1
+
+    state = server._catalog_state("IMAGE_GENERATOR")
+    state.failed_at = time.time() - server.config.CATALOG_RETRY_SECONDS - 1
+    session.failing = False
+
+    assert server.fetch_catalog("IMAGE_GENERATOR") == [{"id": "gpt-4o"}]
+    assert session.calls == 2
+
+
+def test_a_catalog_ttl_of_zero_still_caches_the_catalog(monkeypatch):
+    """A TTL of zero means one fetch a second, not one fetch a request."""
+    monkeypatch.setattr(server.config, "CATALOG_TTL_SECONDS", 0)
+    session = FakeCatalogSession([{"id": "gpt-4o"}])
+    monkeypatch.setattr(server, "get_session", lambda: session)
+
+    assert server.fetch_catalog("IMAGE_GENERATOR") == [{"id": "gpt-4o"}]
+    assert server.fetch_catalog("IMAGE_GENERATOR") == [{"id": "gpt-4o"}]
+    assert session.calls == 1

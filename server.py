@@ -61,6 +61,7 @@ class GatewayConfig:
         "yes",
     )
     CATALOG_TTL_SECONDS: int = int(os.getenv("CATALOG_TTL_SECONDS", "300"))
+    CATALOG_RETRY_SECONDS: int = int(os.getenv("CATALOG_RETRY_SECONDS", "10"))
     MAX_IMAGE_BYTES: int = int(os.getenv("MAX_IMAGE_BYTES", str(10 * 1024 * 1024)))
     CORS_ALLOW_ORIGIN: str = os.getenv("CORS_ALLOW_ORIGIN", "*")
     PORT: int = 5001
@@ -233,21 +234,20 @@ def gateway_version() -> str:
         return "0.1.1"
 
 
-# How long a failed catalog fetch is remembered before the upstream is asked
-# again. A blip must not empty the catalog for the whole TTL.
-CATALOG_RETRY_SECONDS = 10
-
-
 @dataclass
 class _CatalogState:
     """The last known model catalog of one feature.
 
     A copy of the catalog that was fetched successfully is kept, so that a
-    failing upstream does not empty the catalog. The failure is remembered for
-    a short while, so that a burst of requests does not hammer the upstream.
+    failing upstream does not empty the catalog. The copy is None until one was
+    fetched; a catalog that was fetched and holds no models is kept as an empty
+    tuple, so that an upstream that answers without models is not asked again
+    for every request. The failure is remembered for a short while, so that a
+    burst of requests does not hammer the upstream. The copy is served for as
+    long as the upstream is down, which is the trade-off of keeping it.
     """
 
-    entries: tuple[dict[str, Any], ...] = ()
+    entries: tuple[dict[str, Any], ...] | None = None
     fetched_at: float = 0.0
     failed_at: float = 0.0
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -297,6 +297,34 @@ def _request_catalog(feature: str) -> tuple[dict[str, Any], ...]:
     return tuple(entry for entry in models if isinstance(entry, dict))
 
 
+def _catalog_ttl() -> float:
+    """Return how long a fetched catalog is served.
+
+    A TTL of zero or less means the catalog is served for a second, so that
+    the upstream is not asked for it on every request.
+
+    Returns:
+        float: The number of seconds.
+    """
+    return float(config.CATALOG_TTL_SECONDS if config.CATALOG_TTL_SECONDS > 0 else 1)
+
+
+def _catalog_copy(state: _CatalogState) -> list[dict[str, Any]] | None:
+    """Return the catalog that was fetched last, if there is one.
+
+    Args:
+        state: The cache state of a feature.
+
+    Returns:
+        list[dict[str, Any]] | None: The catalog entries, or None when no
+        catalog was ever fetched.
+    """
+    if state.entries is None:
+        return None
+    logger.warning("serving the last known model catalog")
+    return list(state.entries)
+
+
 def fetch_catalog(feature: str) -> list[dict[str, Any]] | None:
     """Fetch the catalog of one feature.
 
@@ -313,21 +341,24 @@ def fetch_catalog(feature: str) -> list[dict[str, Any]] | None:
     """
     state = _catalog_state(feature)
     now = time.time()
-    if state.entries and now - state.fetched_at < config.CATALOG_TTL_SECONDS:
+    if state.entries is not None and now - state.fetched_at < _catalog_ttl():
         return list(state.entries)
-    if state.failed_at and now - state.failed_at < CATALOG_RETRY_SECONDS:
+    if state.failed_at and now - state.failed_at < config.CATALOG_RETRY_SECONDS:
         # A recent attempt failed; the upstream is not asked again yet.
-        return list(state.entries) if state.entries else None
+        return _catalog_copy(state)
 
     # Only one thread fetches a feature at a time, so that a burst of
     # requests causes one upstream call. A caller that has a copy to serve
     # does not wait for the fetch that is already running.
-    if not state.lock.acquire(blocking=not state.entries):
-        return list(state.entries)
+    if not state.lock.acquire(blocking=state.entries is None):
+        return _catalog_copy(state)
     try:
         now = time.time()
-        if state.entries and now - state.fetched_at < config.CATALOG_TTL_SECONDS:
+        if state.entries is not None and now - state.fetched_at < _catalog_ttl():
             return list(state.entries)
+        if state.failed_at and now - state.failed_at < config.CATALOG_RETRY_SECONDS:
+            # The attempt that held the lock failed; do not start another one.
+            return _catalog_copy(state)
         try:
             entries = _request_catalog(feature)
         except requests.RequestException as exc:
@@ -335,23 +366,13 @@ def fetch_catalog(feature: str) -> list[dict[str, Any]] | None:
             logger.warning(
                 "failed to fetch model catalog for feature %s: %s", feature, exc
             )
-            if state.entries:
-                logger.warning(
-                    "serving the last known model catalog for feature %s", feature
-                )
-                return list(state.entries)
-            return None
+            return _catalog_copy(state)
         except ValueError:
             state.failed_at = time.time()
             logger.warning(
                 "failed to parse model catalog response for feature %s", feature
             )
-            if state.entries:
-                logger.warning(
-                    "serving the last known model catalog for feature %s", feature
-                )
-                return list(state.entries)
-            return None
+            return _catalog_copy(state)
         state.entries = entries
         state.fetched_at = time.time()
         state.failed_at = 0.0
@@ -1684,6 +1705,10 @@ def image_generations() -> tuple[Response, int]:
     data = request_json()
     if isinstance(data, tuple):
         return data
+    prompt = data.get("prompt")
+    if not prompt:
+        return error_response("No prompt provided.", 400, "invalid_request_error")
+
     model = data.get("model", config.DEFAULT_IMAGE_MODEL)
     image_ids = image_model_ids()
     if image_ids is None:
@@ -1698,10 +1723,6 @@ def image_generations() -> tuple[Response, int]:
             400,
             "model_not_supported",
         )
-
-    prompt = data.get("prompt")
-    if not prompt:
-        return error_response("No prompt provided.", 400, "invalid_request_error")
 
     # Use connection pool session and custom header propagation
     upstream = get_session().post(
