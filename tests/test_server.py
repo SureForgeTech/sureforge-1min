@@ -211,6 +211,12 @@ def test_non_stream_chat_translates_tool_call(monkeypatch):
 
 def test_stream_response_returns_tool_call_chunks(monkeypatch):
     class FakeResponse:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
         def iter_lines(self, decode_unicode=False):
             return [
                 b"event: content",
@@ -304,6 +310,12 @@ def test_stream_response_large_tool_call_no_truncation():
     long_tool_call_text = f'<tool_call>{{"name":"glob","arguments":{{"pattern":"{long_argument_value}"}}}}</tool_call>'
 
     class FakeResponse:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
         def iter_lines(self, decode_unicode=False):
             return [
                 b"event: content",
@@ -802,3 +814,126 @@ def test_urllib3_major_version_matches_declared_dependency():
 
     assert int(urllib3.__version__.split(".")[0]) >= 2
     assert server.NameResolutionError is urllib3.exceptions.NameResolutionError
+
+
+def _streamed_content(chunks):
+    """Collect the content deltas a stream_response() generator emitted."""
+    out = []
+    for chunk in chunks:
+        if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
+            body = json.loads(chunk[len("data: ") :].strip())
+            out.append(body["choices"][0].get("delta", {}).get("content") or "")
+    return "".join(out)
+
+
+def _delta_stream(text, size):
+    """Split text into upstream SSE deltas of `size` characters."""
+    return [
+        f"data: {json.dumps({'delta': {'content': text[i : i + size]}})}".encode(
+            "utf-8"
+        )
+        for i in range(0, len(text), size)
+    ]
+
+
+def test_stream_response_preserves_whitespace_across_flush_boundary():
+    """Streamed content must reach the client byte for byte, spaces and newlines included."""
+    text = "The quick brown fox jumps over the lazy dog. " * 12
+    text += "a paragraph\nwith two lines\nand a trailing newline\n"
+
+    class FakeResponse:
+        def iter_lines(self, decode_unicode=False):
+            return _delta_stream(text, 120)
+
+        def close(self):
+            pass
+
+    received = _streamed_content(server.stream_response(FakeResponse(), {}, "m"))
+    assert received == text
+
+
+def test_stream_response_drops_crawl_line_split_across_deltas():
+    """A crawl-status line split across deltas is dropped whole, not leaked."""
+    crawl = "\U0001f310 Crawling site https://example.com\n"
+    body = "F" * 180 + "after\n"
+
+    class FakeResponse:
+        def iter_lines(self, decode_unicode=False):
+            return [
+                b"data: "
+                + json.dumps({"delta": {"content": crawl[:29]}}).encode("utf-8"),
+                b"data: "
+                + json.dumps({"delta": {"content": crawl[29:]}}).encode("utf-8"),
+                b"data: " + json.dumps({"delta": {"content": body}}).encode("utf-8"),
+            ]
+
+        def close(self):
+            pass
+
+    received = _streamed_content(server.stream_response(FakeResponse(), {}, "m"))
+    assert received == body
+    assert "Crawling" not in received
+    assert "example.com" not in received
+
+
+def test_stream_response_preserves_trailing_newline():
+    """The final tail is not stripped of its trailing newline."""
+
+    class FakeResponse:
+        def iter_lines(self, decode_unicode=False):
+            return [
+                b"data: " + json.dumps({"delta": {"content": "done\n"}}).encode("utf-8")
+            ]
+
+        def close(self):
+            pass
+
+    received = _streamed_content(server.stream_response(FakeResponse(), {}, "m"))
+    assert received == "done\n"
+
+
+def test_stream_response_closes_upstream_on_tool_call_exit():
+    """The upstream response is closed when the tool-call path returns early."""
+
+    class FakeResponse:
+        def __init__(self):
+            self.closed = False
+
+        def iter_lines(self, decode_unicode=False):
+            return [
+                b"event: content",
+                b'data: {"delta":{"content":"<tool_call>{\\"name\\":\\"glob\\",\\"arguments\\":{\\"pattern\\":\\"*\\"}}</tool_call>"}}',
+                b"",
+                b"data: [DONE]",
+            ]
+
+        def close(self):
+            self.closed = True
+
+    upstream = FakeResponse()
+    list(
+        server.stream_response(
+            upstream, {"tools": [{"function": {"name": "glob"}}]}, "m"
+        )
+    )
+    assert upstream.closed is True
+
+
+def test_stream_response_closes_upstream_when_consumer_stops():
+    """The upstream response is closed when the client disconnects mid-stream."""
+
+    class FakeResponse:
+        def __init__(self):
+            self.closed = False
+
+        def iter_lines(self, decode_unicode=False):
+            yield b'data: {"delta":{"content":"partial"}}'
+
+        def close(self):
+            self.closed = True
+
+    upstream = FakeResponse()
+    stream = server.stream_response(upstream, {}, "m")
+    next(stream)
+    stream.close()
+    assert upstream.closed is True
