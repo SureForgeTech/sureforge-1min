@@ -1222,7 +1222,6 @@ def test_a_caller_with_a_fresh_copy_does_not_wait_for_a_running_fetch(monkeypatc
     monkeypatch.setattr(server, "get_session", lambda: SlowSession())
 
     # The fetch of the feature is running and holds its lock.
-    state.fetched_at = 0.0
     holding = threading.Event()
     release = threading.Event()
 
@@ -1234,13 +1233,20 @@ def test_a_caller_with_a_fresh_copy_does_not_wait_for_a_running_fetch(monkeypatc
     holder = threading.Thread(target=hold_the_lock)
     holder.start()
     assert holding.wait(5)
+    answered: list[Any] = []
+    quick = threading.Thread(
+        target=lambda: answered.append(server.fetch_catalog("IMAGE_GENERATOR"))
+    )
     try:
-        answered = server.fetch_catalog("IMAGE_GENERATOR")
+        quick.start()
+        quick.join(2)
+        # The copy is fresh, so the caller did not wait for the lock.
+        assert not quick.is_alive(), "a caller with a fresh copy waited for the lock"
+        assert answered == [[{"id": "gpt-4o"}]]
     finally:
         release.set()
         holder.join(5)
-
-    assert answered == [{"id": "gpt-4o"}]
+        quick.join(5)
 
 
 def test_a_caller_after_a_failure_does_not_wait_for_a_running_fetch(monkeypatch):
@@ -1263,10 +1269,41 @@ def test_a_caller_after_a_failure_does_not_wait_for_a_running_fetch(monkeypatch)
     holder = threading.Thread(target=hold_the_lock)
     holder.start()
     assert holding.wait(5)
+    answered: list[Any] = []
+    quick = threading.Thread(
+        target=lambda: answered.append(server.fetch_catalog("IMAGE_GENERATOR"))
+    )
     try:
-        answered = server.fetch_catalog("IMAGE_GENERATOR")
+        quick.start()
+        quick.join(2)
+        # The failure is still remembered, so the caller did not wait.
+        assert not quick.is_alive(), "a caller after a failure waited for the lock"
+        assert answered == [None]
     finally:
         release.set()
         holder.join(5)
+        quick.join(5)
 
-    assert answered is None
+
+def test_a_catalog_with_entries_the_gateway_cannot_read_is_a_failure(monkeypatch):
+    """A catalogue whose entries cannot be read never replaces a good one."""
+    session = FakeCatalogSession([{"id": "gpt-4o"}])
+    monkeypatch.setattr(server, "get_session", lambda: session)
+
+    assert server.fetch_catalog("IMAGE_GENERATOR") == [{"id": "gpt-4o"}]
+
+    class UnreadableSession:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def get(self, *args: Any, **kwargs: Any) -> FakeHTTPResponse:
+            self.calls += 1
+            return FakeHTTPResponse(text=json.dumps({"models": [{"name": "gpt-4o"}]}))
+
+    monkeypatch.setattr(server, "get_session", lambda: UnreadableSession())
+    state = server._catalog_state("IMAGE_GENERATOR")
+    state.fetched_at = 0.0
+    state.failed_at = 0.0
+
+    # The good copy is still served.
+    assert server.fetch_catalog("IMAGE_GENERATOR") == [{"id": "gpt-4o"}]
