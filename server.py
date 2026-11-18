@@ -1116,8 +1116,9 @@ def decode_data_image(image_url: str) -> BytesIO | tuple[Response, int]:
         return error_response("Invalid image data URL.", 400, "invalid_image")
     # The encoded text is measured before it is decoded, so a payload that is
     # far over the limit is never turned into bytes in memory. The bound is
-    # the longest text a payload of the limit can have, plus one quantum,
-    # because a payload of one byte more can have the same text length.
+    # the longest text a payload of the limit can have, rounded up to a whole
+    # quantum, because a payload of one or two bytes more can have the same
+    # text length.
     if len(encoded) > 4 * ((config.MAX_IMAGE_BYTES + 4) // 3):
         return error_response("Image payload is too large.", 413, "image_too_large")
     try:

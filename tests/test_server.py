@@ -1134,11 +1134,12 @@ def test_a_body_of_exactly_the_limit_is_accepted(monkeypatch):
     assert "200" in captured["status"]
 
 
-def test_two_images_of_the_limit_still_fit_in_a_request(monkeypatch):
-    """Two images of the image limit fit in the budget of a request."""
-    monkeypatch.setattr(server.config, "MAX_IMAGE_BYTES", 10 * 1024 * 1024)
-    monkeypatch.setattr(server.config, "MAX_REQUEST_BYTES", 32 * 1024 * 1024)
+def test_two_images_of_the_limit_still_fit_in_a_request():
+    """Two images of the image limit fit in the budget of a request.
 
+    The shipped defaults are used on purpose: the budget of a request has to
+    hold the images the per-image limit allows together.
+    """
     image = base64.b64encode(b"x" * server.config.MAX_IMAGE_BYTES).decode()
     body = json.dumps(
         {
@@ -1163,6 +1164,10 @@ def test_two_images_of_the_limit_still_fit_in_a_request(monkeypatch):
     ).encode("utf-8")
 
     assert len(body) < server.config.MAX_REQUEST_BYTES
+    # The shipped budget holds two images of the shipped image limit.
+    assert server.config.MAX_REQUEST_BYTES >= 2 * 4 * (
+        (server.config.MAX_IMAGE_BYTES + 2) // 3
+    )
 
 
 def test_an_image_of_exactly_the_limit_is_accepted(monkeypatch):
