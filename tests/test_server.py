@@ -1212,16 +1212,6 @@ def test_a_caller_with_a_fresh_copy_does_not_wait_for_a_running_fetch(monkeypatc
     assert server.fetch_catalog("IMAGE_GENERATOR") == [{"id": "gpt-4o"}]
 
     state = server._catalog_state("IMAGE_GENERATOR")
-    holding = threading.Event()
-    release = threading.Event()
-
-    class SlowSession:
-        def get(self, *args: Any, **kwargs: Any) -> FakeHTTPResponse:
-            holding.set()
-            release.wait(5)
-            return FakeHTTPResponse(text=json.dumps({"models": [{"id": "gpt-4o"}]}))
-
-    monkeypatch.setattr(server, "get_session", lambda: SlowSession())
 
     # The fetch of the feature is running and holds its lock.
     holding = threading.Event()
