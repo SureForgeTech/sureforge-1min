@@ -1261,6 +1261,10 @@ def extract_result_text(data: dict[str, Any]) -> str | None:
 
 # The pieces a token is made of: a word, a number, or a mark of punctuation.
 _TOKEN_PIECE = re.compile(r"\w+|[^\w\s]")
+# The longest piece that is carried from one piece of text to the next. A
+# longer one is counted as it is, so that the buffer stays bounded. It is far
+# longer than any word a model writes.
+MAX_TOKEN_LENGTH = 65536
 
 
 def stream_with_usage(
@@ -1287,6 +1291,7 @@ def stream_with_usage(
     counter = _TokenCounter()
     stream_id = ""
     model = ""
+    created = int(time.time())
     try:
         for chunk in chunks:
             text, chunk_id, chunk_model = _chunk_parts(chunk)
@@ -1302,7 +1307,7 @@ def stream_with_usage(
                         {
                             "id": stream_id,
                             "object": "chat.completion.chunk",
-                            "created": int(time.time()),
+                            "created": created,
                             "model": model,
                             "choices": [],
                             "usage": {
@@ -1398,7 +1403,13 @@ class _TokenCounter:
             end = len(text)
             while end > 0 and (text[end - 1].isalnum() or text[end - 1] == "_"):
                 end -= 1
-            self._carry = text[end:]
+            word = text[end:]
+            if len(word) > MAX_TOKEN_LENGTH:
+                # A token this long is counted as it is and not carried
+                # further, so that the buffer does not grow without bound.
+                self._count += len(_TOKEN_PIECE.findall(word))
+                word = ""
+            self._carry = word
             text = text[:end]
         self._count += len(_TOKEN_PIECE.findall(text))
 

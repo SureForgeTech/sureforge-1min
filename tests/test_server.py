@@ -841,15 +841,31 @@ def test_a_stream_reports_the_usage_when_the_caller_asks_for_it(monkeypatch):
         headers={"Authorization": "Bearer fake-key"},
     ).get_data(as_text=True)
 
-    assert '"usage"' in body
-    usage = json.loads(
-        [line for line in body.split("\n\n") if '"usage"' in line][0][len("data: ") :]
-    )["usage"]
+    frames = [
+        json.loads(line[len("data: ") :])
+        for line in body.split("\n\n")
+        if line.startswith("data: ") and not line.startswith("data: [DONE]")
+    ]
+    usage_frame = next(f for f in frames if "usage" in f)
+    content_frame = next(f for f in frames if f.get("choices"))
+
+    # The usage chunk is a chunk of the same completion, with no choices.
+    assert usage_frame["choices"] == []
+    assert usage_frame["object"] == "chat.completion.chunk"
+    assert usage_frame["id"] == content_frame["id"]
+    assert usage_frame["model"] == content_frame["model"]
+    assert usage_frame["created"] == content_frame["created"]
+
+    usage = usage_frame["usage"]
     assert usage["prompt_tokens"] > 0
     assert usage["completion_tokens"] > 0
     assert usage["total_tokens"] == (
         usage["prompt_tokens"] + usage["completion_tokens"]
     )
+
+    # The finish-reason chunk is still there, and the usage chunk comes last.
+    assert any(f["choices"][0].get("finish_reason") for f in frames if f["choices"])
+    assert frames.index(usage_frame) == len(frames) - 1
 
 
 def test_a_stream_has_no_usage_chunk_by_default(monkeypatch):
