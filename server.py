@@ -4,8 +4,11 @@ import atexit
 import base64
 import binascii
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import json
 import logging
+import math
 import os
 import socket
 import re
@@ -43,6 +46,47 @@ from werkzeug.http import HTTP_STATUS_CODES
 from waitress import serve
 
 
+logger = logging.getLogger("one-min-ai-gateway")
+
+
+def _int_setting(name: str, default: int) -> int:
+    """Read an integer setting, falling back to its default.
+
+    Args:
+        name: The name of the environment variable.
+        default: The value to use when the variable is missing or unreadable.
+
+    Returns:
+        int: The value of the setting.
+    """
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        logger.warning("the %s setting is not a number; using %d", name, default)
+        return default
+
+
+def _float_setting(name: str, default: float) -> float:
+    """Read a number setting, falling back to its default.
+
+    Args:
+        name: The name of the environment variable.
+        default: The value to use when the variable is missing or unreadable.
+
+    Returns:
+        float: The value of the setting.
+    """
+    try:
+        value = float(os.getenv(name, str(default)))
+    except ValueError:
+        logger.warning("the %s setting is not a number; using %s", name, default)
+        return default
+    if not math.isfinite(value):
+        logger.warning("the %s setting is not a finite number; using %s", name, default)
+        return default
+    return value
+
+
 # 13. Centralized GatewayConfig Class
 @dataclass
 class GatewayConfig:
@@ -62,6 +106,11 @@ class GatewayConfig:
     )
     CATALOG_TTL_SECONDS: int = int(os.getenv("CATALOG_TTL_SECONDS", "300"))
     CATALOG_RETRY_SECONDS: int = int(os.getenv("CATALOG_RETRY_SECONDS", "10"))
+    MAX_UPSTREAM_RETRIES: int = _int_setting("MAX_UPSTREAM_RETRIES", 2)
+    UPSTREAM_RETRY_BACKOFF_SECONDS: float = _float_setting(
+        "UPSTREAM_RETRY_BACKOFF_SECONDS", 0.25
+    )
+    UPSTREAM_RETRY_MAX_SECONDS: float = _float_setting("UPSTREAM_RETRY_MAX_SECONDS", 5)
     MAX_IMAGE_BYTES: int = int(os.getenv("MAX_IMAGE_BYTES", str(10 * 1024 * 1024)))
     # The budget for a whole request. It holds the inline images of a request
     # together: two images of the image limit need about 27 MB.
@@ -90,6 +139,17 @@ class GatewayConfig:
         except ValueError:
             self.WAITRESS_THREADS = 8
 
+        # The retry settings may not be negative and may not be endless: a
+        # negative wait would fail the request instead of waiting, and an
+        # endless one would hold it for ever.
+        self.MAX_UPSTREAM_RETRIES = max(0, min(self.MAX_UPSTREAM_RETRIES, 10))
+        self.UPSTREAM_RETRY_BACKOFF_SECONDS = max(
+            0.0, min(self.UPSTREAM_RETRY_BACKOFF_SECONDS, 60.0)
+        )
+        self.UPSTREAM_RETRY_MAX_SECONDS = max(
+            0.0, min(self.UPSTREAM_RETRY_MAX_SECONDS, 60.0)
+        )
+
 
 # Instantiate global settings configuration
 config = GatewayConfig()
@@ -115,8 +175,6 @@ def asset_api_url() -> str:
 def feature_api_url() -> str:
     return f"{config.ONE_MIN_API_BASE_URL}/api/features"
 
-
-logger = logging.getLogger("one-min-ai-gateway")
 
 # 5. Persistent Connection Pooling
 _session: requests.Session | None = None
@@ -163,6 +221,180 @@ def close_session() -> None:
 
 
 # 17. Custom Header Propagation List
+# The upstream statuses that mean the request was not handled and may be sent
+# again. A timeout or a broken connection is not in this list: the upstream may
+# have handled the request, and sending it again could bill the caller twice.
+RETRY_STATUS_CODES = {429, 503}
+
+
+def _retry_after_seconds(value: str) -> float | None:
+    """Read a Retry-After header, which holds a number of seconds or a date.
+
+    Args:
+        value: The header value.
+
+    Returns:
+        float | None: The number of seconds the header asks for, or None when
+        the value cannot be read.
+    """
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return (when - datetime.now(timezone.utc)).total_seconds()
+
+
+def _retry_delay(attempt: int, response: requests.Response | None) -> float:
+    """Return how long to wait before the next attempt.
+
+    The wait grows with every attempt. A Retry-After header of the upstream is
+    followed, but never shortens the wait and never makes it longer than
+    ``UPSTREAM_RETRY_MAX_SECONDS``.
+
+    Args:
+        attempt: The number of the attempt that just failed, from zero.
+        response: The response that was declined, if there was one.
+
+    Returns:
+        float: The number of seconds to wait.
+    """
+    backoff = min(
+        config.UPSTREAM_RETRY_BACKOFF_SECONDS * (2.0**attempt),
+        config.UPSTREAM_RETRY_MAX_SECONDS,
+    )
+    if response is None:
+        return backoff
+    retry_after = response.headers.get("Retry-After")
+    if not retry_after:
+        return backoff
+    seconds = _retry_after_seconds(retry_after)
+    if seconds is None:
+        logger.warning("upstream sent an unreadable Retry-After header")
+        return backoff
+    if not math.isfinite(seconds):
+        logger.warning("upstream sent a Retry-After header that is not a number")
+        return backoff
+    return min(max(seconds, backoff), config.UPSTREAM_RETRY_MAX_SECONDS)
+
+
+def _file_stream(value: Any) -> Any:
+    """Return the file object of a multipart value, if it carries one.
+
+    The request library accepts a file on its own, a tuple of a name, the file
+    and a content type, and a list of such values.
+
+    Args:
+        value: One value of the files argument.
+
+    Returns:
+        Any: The file object, or None when the value carries none.
+    """
+    if hasattr(value, "read"):
+        return value
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            found = _file_stream(item)
+            if found is not None:
+                return found
+    return None
+
+
+def _rewind_files(kwargs: dict[str, Any], quiet: bool = False) -> bool:
+    """Move the streams of a multipart payload back to their beginning.
+
+    The request library reads a file object while it builds the body, so a
+    payload that is sent again has to start over. Without this the second
+    attempt would upload an empty file.
+
+    Args:
+        kwargs: The arguments of the request.
+        quiet: Whether to leave out the messages about a file that cannot be
+        rewound. The first attempt is not one that is sent again.
+
+    Returns:
+        bool: False when a file cannot be rewound, so that the request must
+        not be sent again.
+    """
+    files = kwargs.get("files")
+    if isinstance(files, dict):
+        values = list(files.values())
+    elif isinstance(files, (list, tuple)):
+        values = list(files)
+    else:
+        return True
+    for value in values:
+        stream = _file_stream(value)
+        if stream is None:
+            # The value carries no file, so there is nothing to rewind.
+            continue
+        seek = getattr(stream, "seek", None)
+        if seek is None:
+            if not quiet:
+                logger.warning("a file that cannot be rewound is not sent again")
+            return False
+        try:
+            seek(0)
+        except (OSError, ValueError, TypeError):
+            if not quiet:
+                logger.warning("could not rewind a file that is sent again")
+            return False
+    return True
+
+
+def post_upstream(label: str, url: str, **kwargs: Any) -> requests.Response:
+    """Send a request to the upstream, retrying one the upstream declined.
+
+    A 429 or 503 means the upstream did not handle the request, so sending it
+    again cannot bill the caller twice. A request that failed in the network
+    is not retried, because the upstream may have handled it.
+
+    Args:
+        label: A short name of the endpoint, used in the log.
+        url: The upstream URL.
+        **kwargs: Passed to the session.
+
+    Returns:
+        requests.Response: The response of the last attempt.
+    """
+    _rewind_files(kwargs, quiet=True)
+    response = get_session().post(url, **kwargs)
+    for attempt in range(config.MAX_UPSTREAM_RETRIES):
+        if response.status_code not in RETRY_STATUS_CODES:
+            break
+        if not _rewind_files(kwargs):
+            # The file cannot be sent again, so the decline is the answer
+            # rather than an upload with nothing in it. The caller is not held
+            # for a wait it would not use.
+            logger.warning("the %s request is not sent again", label)
+            break
+        delay = _retry_delay(attempt, response)
+        logger.warning(
+            "upstream declined the %s request with status %d; retrying in %.2fs",
+            label,
+            response.status_code,
+            delay,
+        )
+        time.sleep(delay)
+        try:
+            sent_again = get_session().post(url, **kwargs)
+        except requests.RequestException:
+            # The upstream may have handled the request, so the decline is a
+            # better answer than a broken connection.
+            logger.warning("the %s request failed while it was sent again", label)
+            break
+        response.close()
+        response = sent_again
+    return response
+
+
 def propagated_headers() -> dict[str, str]:
     """Retrieve propagating headers from current Flask request context.
 
@@ -1426,7 +1658,8 @@ def upload_images(
             return binary_data
 
         # Use connection pool session and propagated headers
-        upload = get_session().post(
+        upload = post_upstream(
+            "asset",
             asset_api_url(),
             files={"asset": (f"gateway-{uuid.uuid4()}.png", binary_data, "image/png")},
             headers={"API-KEY": api_key, **propagated_headers()},
@@ -1620,7 +1853,8 @@ def chat_completions() -> tuple[Response, int] | Response:
     model = data.get("model", config.DEFAULT_CHAT_MODEL)
     if data.get("stream"):
         # Use connection pool session
-        upstream = get_session().post(
+        upstream = post_upstream(
+            "chat",
             chat_stream_api_url(),
             data=json.dumps(payload),
             headers=headers,
@@ -1635,7 +1869,8 @@ def chat_completions() -> tuple[Response, int] | Response:
         )
 
     # Use connection pool session
-    upstream = get_session().post(
+    upstream = post_upstream(
+        "chat",
         chat_api_url(),
         json=payload,
         headers=headers,
@@ -2002,7 +2237,8 @@ def image_generations() -> tuple[Response, int]:
         )
 
     # Use connection pool session and custom header propagation
-    upstream = get_session().post(
+    upstream = post_upstream(
+        "images",
         feature_api_url() + "?isStreaming=false",
         json={
             "type": "IMAGE_GENERATOR",

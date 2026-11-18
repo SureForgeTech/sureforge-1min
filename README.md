@@ -34,6 +34,9 @@ Useful environment variables:
 - `PORT`: listen port inside the container, default `5001`
 - `HOST`: listen host, default `0.0.0.0`
 - `CATALOG_TTL_SECONDS`: model catalog cache TTL in seconds, default `300`
+- `MAX_UPSTREAM_RETRIES`: how many times a request the upstream declined with 429 or 503 is sent again, default `2`, at most `10`
+- `UPSTREAM_RETRY_BACKOFF_SECONDS`: the wait before the first retry, which doubles with every attempt unless the upstream asks for a longer one, default `0.25`, at most `60`
+- `UPSTREAM_RETRY_MAX_SECONDS`: the longest wait any attempt may take, default `5`, at most `60`. A `Retry-After` header of the upstream never shortens the wait and never makes it longer than this
 - `CATALOG_RETRY_SECONDS`: how long a failed model catalog fetch is remembered before the upstream is asked again, default `10`; a value of zero or less means one second
 - When the model catalog cannot be fetched and no earlier copy was kept, `/v1/models`, `/v1/images/generations` and the image path of `/v1/chat/completions` answer `503` with the code `catalog_unavailable`. A catalogue the gateway cannot read -- one whose entries are not objects, or that carry no identifier -- is a failure too, so the last catalogue that was read is served instead
 - `MAX_IMAGE_BYTES`: maximum image upload/fetch payload in bytes, default `10485760` (10 MB)
