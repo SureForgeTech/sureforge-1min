@@ -928,3 +928,55 @@ def test_the_usage_wrapper_closes_the_chunks_when_it_is_stopped():
     next(stream)
     stream.close()
     assert closed == [True]
+
+
+def test_the_usage_chunk_names_the_same_completion_as_the_answer(monkeypatch):
+    """The usage chunk carries the id and the model of the answer it reports on."""
+    monkeypatch.setattr(server, "get_session", lambda: StreamingSession("hello world"))
+    client = server.app.test_client()
+
+    body = client.post(
+        "/v1/chat/completions",
+        json={**_stream_request(), "stream_options": {"include_usage": True}},
+        headers={"Authorization": "Bearer fake-key"},
+    ).get_data(as_text=True)
+
+    frames = [
+        json.loads(line[len("data: ") :])
+        for line in body.split("\n\n")
+        if line.startswith("data: ") and not line.startswith("data: [DONE]")
+    ]
+    content_frame = next(f for f in frames if f["choices"])
+    usage_frame = next(f for f in frames if "usage" in f)
+    assert usage_frame["id"] == content_frame["id"]
+    assert usage_frame["model"] == content_frame["model"] == "gpt-4o"
+
+
+def test_stream_options_of_the_wrong_type_is_ignored(monkeypatch):
+    """A stream_options that is not an object does not break the request."""
+    monkeypatch.setattr(server, "get_session", lambda: StreamingSession("hello world"))
+    client = server.app.test_client()
+
+    for options in ("include_usage", 7, ["include_usage"]):
+        response = client.post(
+            "/v1/chat/completions",
+            json={**_stream_request(), "stream_options": options},
+            headers={"Authorization": "Bearer fake-key"},
+        )
+        assert response.status_code == 200
+        assert '"usage"' not in response.get_data(as_text=True)
+
+
+def test_include_usage_must_be_true(monkeypatch):
+    """A value that is not true does not turn the usage on."""
+    monkeypatch.setattr(server, "get_session", lambda: StreamingSession("hello world"))
+    client = server.app.test_client()
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={**_stream_request(), "stream_options": {"include_usage": "false"}},
+        headers={"Authorization": "Bearer fake-key"},
+    )
+
+    assert response.status_code == 200
+    assert '"usage"' not in response.get_data(as_text=True)

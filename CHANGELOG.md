@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- [FEATURE] A streamed answer can carry the token usage: a request with `stream_options.include_usage` now gets a last chunk with the token counts, as the OpenAI API does. The counts are made of a word, a number or a mark of punctuation each, which needs no model file and no network.
+- [FEATURE] A streamed answer can carry the token usage: a request with `stream_options.include_usage` now gets a last chunk with the token counts, as the OpenAI API does. The counts are made of a word, a number or a mark of punctuation each, which needs no model file and no network; the token counts of a non-streamed answer change with them, because they were counted as a quarter of the characters before.
 - [INTERNAL] Pull requests are now welcome with a DCO sign-off (`git commit -s`): the organization contributing guide says so, and a new `dco` workflow checks the sign-off on pull requests from outside contributors.
 - [INTERNAL] The licence changes from MIT to Apache-2.0, with a NOTICE file. Releases published before this change keep the MIT licence they shipped with; only new releases carry Apache-2.0.
 - [INTERNAL] The copyright holder in `LICENSE` and the author in `pyproject.toml` are now SureForgeTech; the MIT licence text is unchanged.

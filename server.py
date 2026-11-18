@@ -16,7 +16,7 @@ import ipaddress
 from functools import lru_cache
 from importlib import metadata
 from io import BytesIO
-from typing import Any, Generator
+from typing import Any, Generator, Iterator
 from urllib.parse import urlparse, urljoin
 
 import requests
@@ -1264,13 +1264,17 @@ _TOKEN_PIECE = re.compile(r"\w+|[^\w\s]")
 
 
 def stream_with_usage(
-    chunks: Generator[str, None, None], prompt_tokens: int
+    chunks: Iterator[str], prompt_tokens: int
 ) -> Generator[str, None, None]:
     """Add a usage chunk to a stream of event-stream chunks.
 
     The chunk is sent when the caller asked for it with
     ``stream_options.include_usage``, and it carries the token counts of the
-    request and of the answer.
+    request and of the answer. It names the same completion as the answer it
+    reports on, with the id and the model the other chunks carry.
+
+    A tool call is not counted as text: the answer of a tool call is the call
+    itself, which is reported in its own chunk.
 
     Args:
         chunks: The event-stream chunks of the answer.
@@ -1281,10 +1285,17 @@ def stream_with_usage(
         chunk before the last one.
     """
     counter = _TokenCounter()
-    stream_id = f"chatcmpl-{uuid.uuid4()}"
+    stream_id = ""
+    model = ""
     try:
         for chunk in chunks:
-            if chunk == "data: [DONE]\n\n":
+            text, chunk_id, chunk_model = _chunk_parts(chunk)
+            if chunk_id:
+                stream_id = chunk_id
+            if chunk_model:
+                model = chunk_model
+            if chunk.startswith("data: [DONE]"):
+                completion_tokens = counter.total()
                 yield (
                     "data: "
                     + json.dumps(
@@ -1292,12 +1303,12 @@ def stream_with_usage(
                             "id": stream_id,
                             "object": "chat.completion.chunk",
                             "created": int(time.time()),
-                            "model": "",
+                            "model": model,
                             "choices": [],
                             "usage": {
                                 "prompt_tokens": prompt_tokens,
-                                "completion_tokens": counter.total(),
-                                "total_tokens": prompt_tokens + counter.total(),
+                                "completion_tokens": completion_tokens,
+                                "total_tokens": prompt_tokens + completion_tokens,
                             },
                         },
                         ensure_ascii=False,
@@ -1306,7 +1317,7 @@ def stream_with_usage(
                 )
                 yield chunk
                 continue
-            counter.add(_chunk_content(chunk))
+            counter.add(text)
             yield chunk
     finally:
         # The chunks are closed with the wrapper, so that the upstream response
@@ -1316,32 +1327,32 @@ def stream_with_usage(
             close()
 
 
-def _chunk_content(chunk: str) -> str:
-    """Return the text an event-stream chunk carries.
+def _chunk_parts(chunk: str) -> tuple[str, str, str]:
+    """Read an event-stream chunk.
 
     Args:
         chunk: One event-stream chunk.
 
     Returns:
-        str: The text of the chunk, or an empty string when it carries none.
+        tuple[str, str, str]: The text of the chunk (empty when it carries
+        none), the id of the completion it belongs to and the model it names.
     """
     if not chunk.startswith("data: ") or chunk.startswith("data: [DONE]"):
-        return ""
+        return "", "", ""
     try:
         body = json.loads(chunk[len("data: ") :].strip())
     except json.JSONDecodeError:
-        return ""
-    choices = body.get("choices")
-    if not isinstance(choices, list):
-        return ""
+        return "", "", ""
     text = ""
-    for choice in choices:
-        if not isinstance(choice, dict):
-            continue
-        delta = choice.get("delta")
-        if isinstance(delta, dict):
-            text += delta.get("content") or ""
-    return text
+    choices = body.get("choices")
+    if isinstance(choices, list):
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            delta = choice.get("delta")
+            if isinstance(delta, dict):
+                text += delta.get("content") or ""
+    return text, str(body.get("id") or ""), str(body.get("model") or "")
 
 
 def token_count(text: str) -> int:
@@ -1489,8 +1500,9 @@ def chat_completions() -> tuple[Response, int] | Response:
         )
         if upstream.status_code != 200:
             return upstream_error(upstream)
-        stream = stream_response(upstream, data, model)
-        if (data.get("stream_options") or {}).get("include_usage"):
+        stream: Iterator[str] = stream_response(upstream, data, model)
+        options = data.get("stream_options")
+        if isinstance(options, dict) and options.get("include_usage") is True:
             stream = stream_with_usage(
                 stream, token_count(payload["promptObject"]["prompt"])
             )
