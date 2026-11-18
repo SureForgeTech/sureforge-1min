@@ -558,6 +558,8 @@ class FakeCatalogSession:
             # for the lock to reach it.
             time.sleep(0.05)
             raise server.requests.ConnectionError("upstream blip")
+        # The answer takes long enough for the other callers to wait for it.
+        time.sleep(0.05)
         return FakeHTTPResponse(text=json.dumps({"models": self.models}))
 
 
@@ -1307,3 +1309,28 @@ def test_a_catalog_with_entries_the_gateway_cannot_read_is_a_failure(monkeypatch
 
     # The good copy is still served.
     assert server.fetch_catalog("IMAGE_GENERATOR") == [{"id": "gpt-4o"}]
+
+
+def test_a_caller_without_a_copy_waits_for_the_running_fetch(monkeypatch):
+    """A caller without a copy waits for the fetch that is running."""
+    import threading
+
+    session = FakeCatalogSession([{"id": "gpt-4o"}])
+    monkeypatch.setattr(server, "get_session", lambda: session)
+
+    answers: list[Any] = []
+    barrier = threading.Barrier(4)
+
+    def worker() -> None:
+        barrier.wait()
+        answers.append(server.fetch_catalog("IMAGE_GENERATOR"))
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+
+    # One upstream call, and every caller is answered with the catalogue.
+    assert session.calls == 1
+    assert answers == [[{"id": "gpt-4o"}]] * 4

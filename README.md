@@ -35,7 +35,7 @@ Useful environment variables:
 - `HOST`: listen host, default `0.0.0.0`
 - `CATALOG_TTL_SECONDS`: model catalog cache TTL in seconds, default `300`
 - `CATALOG_RETRY_SECONDS`: how long a failed model catalog fetch is remembered before the upstream is asked again, default `10`; a value of zero or less means one second
-- When the model catalog cannot be fetched and no earlier copy was kept, `/v1/models`, `/v1/images/generations` and the image path of `/v1/chat/completions` answer `503` with the code `catalog_unavailable`
+- When the model catalog cannot be fetched and no earlier copy was kept, `/v1/models`, `/v1/images/generations` and the image path of `/v1/chat/completions` answer `503` with the code `catalog_unavailable`. A catalogue the gateway cannot read -- one whose entries are not objects, or that carry no identifier -- is a failure too, so the last catalogue that was read is served instead
 - `MAX_IMAGE_BYTES`: maximum image upload/fetch payload in bytes, default `10485760` (10 MB)
 - `CORS_ALLOW_ORIGIN`: CORS origin value, default `*`
 - `DEFAULT_CHAT_MODEL`: default fallback chat model, default `gpt-4o`
