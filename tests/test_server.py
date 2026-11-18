@@ -887,8 +887,12 @@ def test_main_passes_the_body_limit_to_waitress(monkeypatch):
     server.main()
 
     # The server in front is a last resort: the application refuses the body
-    # first, so that the answer carries the OpenAI error shape.
-    assert captured["max_request_body_size"] > server.config.MAX_REQUEST_BYTES
+    # first, so that the answer carries the OpenAI error shape. The margin
+    # holds the body the application reads.
+    assert (
+        captured["max_request_body_size"]
+        >= server.config.MAX_REQUEST_BYTES + 1024 * 1024
+    )
 
 
 def test_a_body_without_a_declared_length_is_refused(monkeypatch):
