@@ -63,7 +63,9 @@ class GatewayConfig:
     )
     CATALOG_TTL_SECONDS: int = int(os.getenv("CATALOG_TTL_SECONDS", "300"))
     MAX_IMAGE_BYTES: int = int(os.getenv("MAX_IMAGE_BYTES", str(10 * 1024 * 1024)))
-    MAX_REQUEST_BYTES: int = int(os.getenv("MAX_REQUEST_BYTES", str(16 * 1024 * 1024)))
+    # The budget for a whole request. It holds the inline images of a request
+    # together: two images of the image limit need about 27 MB.
+    MAX_REQUEST_BYTES: int = int(os.getenv("MAX_REQUEST_BYTES", str(32 * 1024 * 1024)))
     CORS_ALLOW_ORIGIN: str = os.getenv("CORS_ALLOW_ORIGIN", "*")
     PORT: int = 5001
     HOST: str = os.getenv("HOST", "0.0.0.0")
@@ -432,6 +434,7 @@ def request_json() -> dict[str, Any] | tuple[Response, int]:
     # refused by the framework, but a request that declares no length would
     # otherwise be read to its end.
     limit = config.MAX_REQUEST_BYTES
+    # A body that declares its length is refused before it is read.
     if request.content_length is not None and request.content_length > limit:
         return error_response(
             f"The request body is larger than {limit} bytes.",
@@ -439,8 +442,8 @@ def request_json() -> dict[str, Any] | tuple[Response, int]:
             "request_too_large",
         )
     # The body is read from the raw input with a limit of its own. The
-    # framework cuts a body whose length is not declared short without a
-    # word, so the excess would go unnoticed.
+    # framework does not limit a body whose length is not declared, so the
+    # excess would go unnoticed without it.
     raw = request.environ.get("wsgi.input")
     body = raw.read(limit + 1) if raw is not None else b""
     if len(body) > limit:
@@ -1703,7 +1706,8 @@ def create_app() -> Flask:
     app.url_map.strict_slashes = False
     # A backstop for anything that reads the body through the framework. The
     # application reads the raw input with a limit of its own, so that a body
-    # which declares no length is refused as well.
+    # which declares no length is refused as well. The handler below answers
+    # with the OpenAI error shape when the framework trips this limit.
     app.config["MAX_CONTENT_LENGTH"] = config.MAX_REQUEST_BYTES
 
     # 11. Relocate global logging initialization inside create_app

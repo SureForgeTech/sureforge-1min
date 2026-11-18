@@ -35,7 +35,7 @@ Useful environment variables:
 - `HOST`: listen host, default `0.0.0.0`
 - `CATALOG_TTL_SECONDS`: model catalog cache TTL in seconds, default `300`
 - `MAX_IMAGE_BYTES`: maximum image upload/fetch payload in bytes, default `10485760` (10 MB)
-- `MAX_REQUEST_BYTES`: maximum accepted request body in bytes, default `16777216` (16 MB); a larger body is refused with `413` before it is read into memory. The server in front of the gateway refuses bodies over one megabyte more with a plain-text `413`, because it cannot answer with the error shape of the gateway
+- `MAX_REQUEST_BYTES`: the budget for a whole request in bytes, default `33554432` (32 MB); a larger body is refused with `413`. The budget holds the inline images of a request together: two images of the image limit need about 27 MB, and a body over one megabyte more than the budget is refused by the server in front of the gateway, with a plain-text `413`, because it cannot answer with the error shape of the gateway
 - `CORS_ALLOW_ORIGIN`: CORS origin value, default `*`
 - `DEFAULT_CHAT_MODEL`: default fallback chat model, default `gpt-4o`
 - `DEFAULT_IMAGE_MODEL`: default fallback image generator model, default `black-forest-labs/flux-schnell`

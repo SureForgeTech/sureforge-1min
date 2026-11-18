@@ -1132,3 +1132,45 @@ def test_a_body_of_exactly_the_limit_is_accepted(monkeypatch):
     b"".join(server.create_app()(environ, start_response))
 
     assert "200" in captured["status"]
+
+
+def test_two_images_of_the_limit_still_fit_in_a_request(monkeypatch):
+    """Two images of the image limit fit in the budget of a request."""
+    monkeypatch.setattr(server.config, "MAX_IMAGE_BYTES", 10 * 1024 * 1024)
+    monkeypatch.setattr(server.config, "MAX_REQUEST_BYTES", 32 * 1024 * 1024)
+
+    image = base64.b64encode(b"x" * server.config.MAX_IMAGE_BYTES).decode()
+    body = json.dumps(
+        {
+            "model": "gpt-4o",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "hi"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{image}"},
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{image}"},
+                        },
+                    ],
+                }
+            ],
+        }
+    ).encode("utf-8")
+
+    assert len(body) < server.config.MAX_REQUEST_BYTES
+
+
+def test_an_image_of_exactly_the_limit_is_accepted(monkeypatch):
+    """An image of exactly the image limit is accepted."""
+    monkeypatch.setattr(server.config, "MAX_IMAGE_BYTES", 16)
+    encoded = base64.b64encode(b"x" * 16).decode()
+
+    with server.app.app_context():
+        result = server.decode_data_image(f"data:image/png;base64,{encoded}")
+
+    assert not isinstance(result, tuple)
