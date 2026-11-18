@@ -948,6 +948,8 @@ def test_the_wait_grows_with_every_attempt(monkeypatch):
     monkeypatch.setattr(server, "get_session", lambda: session)
     monkeypatch.setattr(server, "chat_models", lambda: [{"id": "gpt-4o"}])
     monkeypatch.setattr(server.time, "sleep", waits.append)
+    monkeypatch.setattr(server.config, "MAX_UPSTREAM_RETRIES", 2)
+    monkeypatch.setattr(server.config, "UPSTREAM_RETRY_BACKOFF_SECONDS", 0.25)
 
     client = server.app.test_client()
     client.post("/v1/chat/completions", json=_chat_body(), headers=_chat_headers())
@@ -970,6 +972,7 @@ def test_the_wait_is_capped(monkeypatch):
     monkeypatch.setattr(server, "get_session", lambda: session)
     monkeypatch.setattr(server, "chat_models", lambda: [{"id": "gpt-4o"}])
     monkeypatch.setattr(server.time, "sleep", waits.append)
+    monkeypatch.setattr(server.config, "UPSTREAM_RETRY_MAX_SECONDS", 5.0)
 
     client = server.app.test_client()
     client.post("/v1/chat/completions", json=_chat_body(), headers=_chat_headers())
@@ -1028,4 +1031,112 @@ def test_a_file_that_is_sent_again_is_sent_whole(monkeypatch):
 
     assert session.calls == server.config.MAX_UPSTREAM_RETRIES + 1
     assert session.bodies[0] == payload
+    assert all(body == payload for body in session.bodies)
+
+
+def test_a_retry_after_with_a_date_is_followed(monkeypatch):
+    """A Retry-After that holds a date is followed."""
+    from datetime import datetime, timedelta, timezone
+    from email.utils import format_datetime
+
+    when = format_datetime(datetime.now(timezone.utc) + timedelta(seconds=3))
+
+    class Response:
+        status_code = 503
+        headers = {"Retry-After": when}
+
+    delay = server._retry_delay(0, Response())
+
+    assert 1.0 < delay <= 3.0
+
+
+def test_a_replaced_response_is_closed(monkeypatch):
+    """The response that is replaced is closed."""
+    closed: list[bool] = []
+
+    class Response:
+        def __init__(self, status_code: int) -> None:
+            self.status_code = status_code
+            self.headers: dict[str, str] = {}
+
+        def close(self) -> None:
+            closed.append(True)
+
+    class Session:
+        def __init__(self) -> None:
+            self.responses = [Response(503), Response(200)]
+
+        def post(self, *args: Any, **kwargs: Any) -> Any:
+            return self.responses.pop(0)
+
+    session = Session()
+    monkeypatch.setattr(server, "get_session", lambda: session)
+    monkeypatch.setattr(server.time, "sleep", lambda seconds: None)
+
+    response = server.post_upstream("chat", "https://example.invalid/chat")
+
+    assert response.status_code == 200
+    assert closed == [True]
+
+
+def test_a_retry_that_fails_in_the_network_keeps_the_decline(monkeypatch):
+    """A retry that fails in the network answers with the decline."""
+    responses = [
+        FakeHTTPResponse(status_code=503, text="busy"),
+        server.requests.ConnectionError("connection reset"),
+    ]
+
+    class Session:
+        def post(self, *args: Any, **kwargs: Any) -> Any:
+            item = responses.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+    monkeypatch.setattr(server, "get_session", lambda: Session())
+    monkeypatch.setattr(server.time, "sleep", lambda seconds: None)
+
+    response = server.post_upstream("chat", "https://example.invalid/chat")
+
+    assert response.status_code == 503
+
+
+def test_a_retry_setting_that_is_negative_is_clamped():
+    """A retry setting that is negative cannot make the wait negative."""
+    config = server.GatewayConfig()
+    config.MAX_UPSTREAM_RETRIES = -1
+    config.UPSTREAM_RETRY_BACKOFF_SECONDS = -1.0
+    config.UPSTREAM_RETRY_MAX_SECONDS = -1.0
+    config.__post_init__()
+
+    assert config.MAX_UPSTREAM_RETRIES == 0
+    assert config.UPSTREAM_RETRY_BACKOFF_SECONDS == 0.0
+    assert config.UPSTREAM_RETRY_MAX_SECONDS == 0.0
+
+
+def test_a_file_that_is_sent_again_is_rewound_in_the_list_form(monkeypatch):
+    """A file that is sent again as a list is rewound too."""
+
+    class UploadSession:
+        def __init__(self) -> None:
+            self.bodies: list[bytes] = []
+
+        def post(self, *args: Any, **kwargs: Any) -> FakeHTTPResponse:
+            stream = server._file_stream(kwargs["files"][0])
+            self.bodies.append(stream.read())
+            return FakeHTTPResponse(status_code=503, text="busy")
+
+    session = UploadSession()
+    monkeypatch.setattr(server, "get_session", lambda: session)
+    monkeypatch.setattr(server.time, "sleep", lambda seconds: None)
+
+    payload = b"\x89PNG\r\n\x1a\n" + b"x" * 16
+    stream = BytesIO(payload)
+    server.post_upstream(
+        "asset",
+        "https://example.invalid/assets",
+        files=[("asset", ("a.png", stream, "image/png"))],
+    )
+
+    assert session.bodies
     assert all(body == payload for body in session.bodies)

@@ -97,6 +97,14 @@ class GatewayConfig:
         except ValueError:
             self.WAITRESS_THREADS = 8
 
+        # The retry settings may not be negative: a negative wait would fail
+        # the request instead of waiting.
+        self.MAX_UPSTREAM_RETRIES = max(0, self.MAX_UPSTREAM_RETRIES)
+        self.UPSTREAM_RETRY_BACKOFF_SECONDS = max(
+            0.0, self.UPSTREAM_RETRY_BACKOFF_SECONDS
+        )
+        self.UPSTREAM_RETRY_MAX_SECONDS = max(0.0, self.UPSTREAM_RETRY_MAX_SECONDS)
+
 
 # Instantiate global settings configuration
 config = GatewayConfig()
@@ -226,8 +234,31 @@ def _retry_delay(attempt: int, response: requests.Response | None) -> float:
         logger.warning("upstream sent an unreadable Retry-After header")
         return backoff
     if not math.isfinite(seconds):
-        seconds = config.UPSTREAM_RETRY_MAX_SECONDS
+        logger.warning("upstream sent a Retry-After header that is not a number")
+        return backoff
     return min(max(seconds, backoff), config.UPSTREAM_RETRY_MAX_SECONDS)
+
+
+def _file_stream(value: Any) -> Any:
+    """Return the file object of a multipart value, if it carries one.
+
+    The request library accepts a file on its own, a tuple of a name, the file
+    and a content type, and a list of such values.
+
+    Args:
+        value: One value of the files argument.
+
+    Returns:
+        Any: The file object, or None when the value carries none.
+    """
+    if hasattr(value, "read"):
+        return value
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            found = _file_stream(item)
+            if found is not None:
+                return found
+    return None
 
 
 def _rewind_files(kwargs: dict[str, Any]) -> None:
@@ -241,15 +272,19 @@ def _rewind_files(kwargs: dict[str, Any]) -> None:
         kwargs: The arguments of the request.
     """
     files = kwargs.get("files")
-    if not isinstance(files, dict):
+    if isinstance(files, dict):
+        values = list(files.values())
+    elif isinstance(files, (list, tuple)):
+        values = list(files)
+    else:
         return
-    for value in files.values():
-        stream = value[1] if isinstance(value, tuple) and len(value) > 1 else value
-        seek = getattr(stream, "seek", None)
-        if seek is None:
+    for value in values:
+        stream = _file_stream(value)
+        if stream is None:
+            logger.warning("a file that is sent again cannot be rewound")
             continue
         try:
-            seek(0)
+            stream.seek(0)
         except (OSError, ValueError):
             logger.warning("could not rewind a file that is sent again")
 
