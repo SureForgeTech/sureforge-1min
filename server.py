@@ -3,9 +3,12 @@ from __future__ import annotations
 import atexit
 import base64
 import binascii
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import json
 import logging
+import math
 import os
 import socket
 import re
@@ -13,7 +16,6 @@ import threading
 import time
 import uuid
 import ipaddress
-from functools import lru_cache
 from importlib import metadata
 from io import BytesIO
 from typing import Any, Generator, Iterator
@@ -39,9 +41,50 @@ from flask import (
     g,
     has_request_context,
 )
-from werkzeug.exceptions import BadRequest, HTTPException
+from werkzeug.exceptions import HTTPException, RequestEntityTooLarge
 from werkzeug.http import HTTP_STATUS_CODES
 from waitress import serve
+
+
+logger = logging.getLogger("one-min-ai-gateway")
+
+
+def _int_setting(name: str, default: int) -> int:
+    """Read an integer setting, falling back to its default.
+
+    Args:
+        name: The name of the environment variable.
+        default: The value to use when the variable is missing or unreadable.
+
+    Returns:
+        int: The value of the setting.
+    """
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        logger.warning("the %s setting is not a number; using %d", name, default)
+        return default
+
+
+def _float_setting(name: str, default: float) -> float:
+    """Read a number setting, falling back to its default.
+
+    Args:
+        name: The name of the environment variable.
+        default: The value to use when the variable is missing or unreadable.
+
+    Returns:
+        float: The value of the setting.
+    """
+    try:
+        value = float(os.getenv(name, str(default)))
+    except ValueError:
+        logger.warning("the %s setting is not a number; using %s", name, default)
+        return default
+    if not math.isfinite(value):
+        logger.warning("the %s setting is not a finite number; using %s", name, default)
+        return default
+    return value
 
 
 # 13. Centralized GatewayConfig Class
@@ -62,7 +105,16 @@ class GatewayConfig:
         "yes",
     )
     CATALOG_TTL_SECONDS: int = int(os.getenv("CATALOG_TTL_SECONDS", "300"))
+    CATALOG_RETRY_SECONDS: int = int(os.getenv("CATALOG_RETRY_SECONDS", "10"))
+    MAX_UPSTREAM_RETRIES: int = _int_setting("MAX_UPSTREAM_RETRIES", 2)
+    UPSTREAM_RETRY_BACKOFF_SECONDS: float = _float_setting(
+        "UPSTREAM_RETRY_BACKOFF_SECONDS", 0.25
+    )
+    UPSTREAM_RETRY_MAX_SECONDS: float = _float_setting("UPSTREAM_RETRY_MAX_SECONDS", 5)
     MAX_IMAGE_BYTES: int = int(os.getenv("MAX_IMAGE_BYTES", str(10 * 1024 * 1024)))
+    # The budget for a whole request. It holds the inline images of a request
+    # together: two images of the image limit need about 27 MB.
+    MAX_REQUEST_BYTES: int = int(os.getenv("MAX_REQUEST_BYTES", str(32 * 1024 * 1024)))
     CORS_ALLOW_ORIGIN: str = os.getenv("CORS_ALLOW_ORIGIN", "*")
     PORT: int = 5001
     HOST: str = os.getenv("HOST", "0.0.0.0")
@@ -86,6 +138,17 @@ class GatewayConfig:
             self.WAITRESS_THREADS = int(threads_env)
         except ValueError:
             self.WAITRESS_THREADS = 8
+
+        # The retry settings may not be negative and may not be endless: a
+        # negative wait would fail the request instead of waiting, and an
+        # endless one would hold it for ever.
+        self.MAX_UPSTREAM_RETRIES = max(0, min(self.MAX_UPSTREAM_RETRIES, 10))
+        self.UPSTREAM_RETRY_BACKOFF_SECONDS = max(
+            0.0, min(self.UPSTREAM_RETRY_BACKOFF_SECONDS, 60.0)
+        )
+        self.UPSTREAM_RETRY_MAX_SECONDS = max(
+            0.0, min(self.UPSTREAM_RETRY_MAX_SECONDS, 60.0)
+        )
 
 
 # Instantiate global settings configuration
@@ -112,8 +175,6 @@ def asset_api_url() -> str:
 def feature_api_url() -> str:
     return f"{config.ONE_MIN_API_BASE_URL}/api/features"
 
-
-logger = logging.getLogger("one-min-ai-gateway")
 
 # 5. Persistent Connection Pooling
 _session: requests.Session | None = None
@@ -160,6 +221,180 @@ def close_session() -> None:
 
 
 # 17. Custom Header Propagation List
+# The upstream statuses that mean the request was not handled and may be sent
+# again. A timeout or a broken connection is not in this list: the upstream may
+# have handled the request, and sending it again could bill the caller twice.
+RETRY_STATUS_CODES = {429, 503}
+
+
+def _retry_after_seconds(value: str) -> float | None:
+    """Read a Retry-After header, which holds a number of seconds or a date.
+
+    Args:
+        value: The header value.
+
+    Returns:
+        float | None: The number of seconds the header asks for, or None when
+        the value cannot be read.
+    """
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return (when - datetime.now(timezone.utc)).total_seconds()
+
+
+def _retry_delay(attempt: int, response: requests.Response | None) -> float:
+    """Return how long to wait before the next attempt.
+
+    The wait grows with every attempt. A Retry-After header of the upstream is
+    followed, but never shortens the wait and never makes it longer than
+    ``UPSTREAM_RETRY_MAX_SECONDS``.
+
+    Args:
+        attempt: The number of the attempt that just failed, from zero.
+        response: The response that was declined, if there was one.
+
+    Returns:
+        float: The number of seconds to wait.
+    """
+    backoff = min(
+        config.UPSTREAM_RETRY_BACKOFF_SECONDS * (2.0**attempt),
+        config.UPSTREAM_RETRY_MAX_SECONDS,
+    )
+    if response is None:
+        return backoff
+    retry_after = response.headers.get("Retry-After")
+    if not retry_after:
+        return backoff
+    seconds = _retry_after_seconds(retry_after)
+    if seconds is None:
+        logger.warning("upstream sent an unreadable Retry-After header")
+        return backoff
+    if not math.isfinite(seconds):
+        logger.warning("upstream sent a Retry-After header that is not a number")
+        return backoff
+    return min(max(seconds, backoff), config.UPSTREAM_RETRY_MAX_SECONDS)
+
+
+def _file_stream(value: Any) -> Any:
+    """Return the file object of a multipart value, if it carries one.
+
+    The request library accepts a file on its own, a tuple of a name, the file
+    and a content type, and a list of such values.
+
+    Args:
+        value: One value of the files argument.
+
+    Returns:
+        Any: The file object, or None when the value carries none.
+    """
+    if hasattr(value, "read"):
+        return value
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            found = _file_stream(item)
+            if found is not None:
+                return found
+    return None
+
+
+def _rewind_files(kwargs: dict[str, Any], quiet: bool = False) -> bool:
+    """Move the streams of a multipart payload back to their beginning.
+
+    The request library reads a file object while it builds the body, so a
+    payload that is sent again has to start over. Without this the second
+    attempt would upload an empty file.
+
+    Args:
+        kwargs: The arguments of the request.
+        quiet: Whether to leave out the messages about a file that cannot be
+        rewound. The first attempt is not one that is sent again.
+
+    Returns:
+        bool: False when a file cannot be rewound, so that the request must
+        not be sent again.
+    """
+    files = kwargs.get("files")
+    if isinstance(files, dict):
+        values = list(files.values())
+    elif isinstance(files, (list, tuple)):
+        values = list(files)
+    else:
+        return True
+    for value in values:
+        stream = _file_stream(value)
+        if stream is None:
+            # The value carries no file, so there is nothing to rewind.
+            continue
+        seek = getattr(stream, "seek", None)
+        if seek is None:
+            if not quiet:
+                logger.warning("a file that cannot be rewound is not sent again")
+            return False
+        try:
+            seek(0)
+        except (OSError, ValueError, TypeError):
+            if not quiet:
+                logger.warning("could not rewind a file that is sent again")
+            return False
+    return True
+
+
+def post_upstream(label: str, url: str, **kwargs: Any) -> requests.Response:
+    """Send a request to the upstream, retrying one the upstream declined.
+
+    A 429 or 503 means the upstream did not handle the request, so sending it
+    again cannot bill the caller twice. A request that failed in the network
+    is not retried, because the upstream may have handled it.
+
+    Args:
+        label: A short name of the endpoint, used in the log.
+        url: The upstream URL.
+        **kwargs: Passed to the session.
+
+    Returns:
+        requests.Response: The response of the last attempt.
+    """
+    _rewind_files(kwargs, quiet=True)
+    response = get_session().post(url, **kwargs)
+    for attempt in range(config.MAX_UPSTREAM_RETRIES):
+        if response.status_code not in RETRY_STATUS_CODES:
+            break
+        if not _rewind_files(kwargs):
+            # The file cannot be sent again, so the decline is the answer
+            # rather than an upload with nothing in it. The caller is not held
+            # for a wait it would not use.
+            logger.warning("the %s request is not sent again", label)
+            break
+        delay = _retry_delay(attempt, response)
+        logger.warning(
+            "upstream declined the %s request with status %d; retrying in %.2fs",
+            label,
+            response.status_code,
+            delay,
+        )
+        time.sleep(delay)
+        try:
+            sent_again = get_session().post(url, **kwargs)
+        except requests.RequestException:
+            # The upstream may have handled the request, so the decline is a
+            # better answer than a broken connection.
+            logger.warning("the %s request failed while it was sent again", label)
+            break
+        response.close()
+        response = sent_again
+    return response
+
+
 def propagated_headers() -> dict[str, str]:
     """Retrieve propagating headers from current Flask request context.
 
@@ -234,78 +469,188 @@ def gateway_version() -> str:
         return "0.1.1"
 
 
-def cache_bucket() -> int:
-    """Generate cache bucket key based on the TTL configuration.
+@dataclass
+class _CatalogState:
+    """The last known model catalog of one feature.
 
-    Returns:
-        int: Time-based bucket identifier.
+    A copy of the catalog that was fetched successfully is kept, so that a
+    failing upstream does not empty the catalog. The copy is None until one was
+    fetched; a catalog that was fetched and holds no models is kept as an empty
+    tuple, so that an upstream that answers without models is not asked again
+    for every request. A response whose shape the gateway does not know, or
+    whose entries it cannot read, is a failure, so it never replaces a good
+    copy. The failure is remembered for a
+    short while, so that a burst of requests does not hammer the upstream. The
+    copy is served for as long as the upstream is down, which is the trade-off
+    of keeping it.
     """
-    return (
-        int(time.time() // config.CATALOG_TTL_SECONDS)
-        if config.CATALOG_TTL_SECONDS > 0
-        else int(time.time())
-    )
+
+    entries: tuple[dict[str, Any], ...] | None = None
+    fetched_at: float = 0.0
+    failed_at: float = 0.0
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
 
-# 4. Cache Stampede Protection (Mutex Locking)
-_catalog_mutex = threading.Lock()
+_catalog_states: dict[str, _CatalogState] = {}
+_catalog_states_lock = threading.Lock()
 
 
-@lru_cache(maxsize=32)
-def fetch_catalog_cached(feature: str, _bucket: int) -> tuple[dict[str, Any], ...]:
-    """Fetch model catalog with TTL caching and Cache Stampede protection.
-
-    Args:
-        feature: The model feature identifier.
-        _bucket: The current cache bucket ID.
-
-    Returns:
-        tuple[dict[str, Any], ...]: The models entries catalog.
-    """
-    with _catalog_mutex:
-        try:
-            response = get_session().get(
-                model_api_url(),
-                params={"feature": feature},
-                timeout=30,
-                verify=config.GATEWAY_VERIFY_SSL,
-            )
-            response.raise_for_status()
-            data = response.json()
-        except requests.RequestException as exc:
-            logger.warning(
-                "failed to fetch model catalog for feature %s: %s", feature, exc
-            )
-            return tuple()
-        except ValueError:
-            logger.warning(
-                "failed to parse model catalog response for feature %s", feature
-            )
-            return tuple()
-
-        models = data.get("models") if isinstance(data, dict) else []
-        if not isinstance(models, list):
-            models = []
-        return tuple(entry for entry in models if isinstance(entry, dict))
-
-
-def fetch_catalog(feature: str) -> list[dict[str, Any]]:
-    """Fetch catalog for a given feature using active cache bucket.
+def _catalog_state(feature: str) -> _CatalogState:
+    """Return the cache state of one feature, creating it when needed.
 
     Args:
         feature: The feature identifier.
 
     Returns:
-        list[dict[str, Any]]: List of matching models.
+        _CatalogState: The cache state of the feature.
     """
-    return list(fetch_catalog_cached(feature, cache_bucket()))
+    with _catalog_states_lock:
+        state = _catalog_states.get(feature)
+        if state is None:
+            state = _CatalogState()
+            _catalog_states[feature] = state
+        return state
 
 
-def chat_models() -> list[dict[str, Any]]:
+def _request_catalog(feature: str) -> tuple[dict[str, Any], ...]:
+    """Ask the upstream for the model catalog of one feature.
+
+    Args:
+        feature: The feature identifier.
+
+    Returns:
+        tuple[dict[str, Any], ...]: The catalog entries.
+    """
+    response = get_session().get(
+        model_api_url(),
+        params={"feature": feature},
+        timeout=30,
+        verify=config.GATEWAY_VERIFY_SSL,
+    )
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, dict) or not isinstance(data.get("models"), list):
+        # The upstream answered with a shape the gateway does not know. That
+        # is a failure, not an empty catalogue: the last good one is kept.
+        raise ValueError("the model catalog response has an unexpected shape")
+    entries = tuple(entry for entry in data["models"] if isinstance(entry, dict))
+    if len(entries) != len(data["models"]):
+        raise ValueError(
+            "the model catalog response holds an entry the gateway cannot read"
+        )
+    for entry in entries:
+        if not model_id(entry):
+            raise ValueError(
+                "the model catalog response holds an entry without an identifier"
+            )
+    return entries
+
+
+def _catalog_retry() -> float:
+    """Return how long a failed fetch is remembered.
+
+    An interval of zero or less means one second, so that the upstream is not
+    asked again for every request.
+
+    Returns:
+        float: The number of seconds.
+    """
+    return float(
+        config.CATALOG_RETRY_SECONDS if config.CATALOG_RETRY_SECONDS > 0 else 1
+    )
+
+
+def _catalog_ttl() -> float:
+    """Return how long a fetched catalog is served.
+
+    A TTL of zero or less means the catalog is served for a second, so that
+    the upstream is not asked for it on every request.
+
+    Returns:
+        float: The number of seconds.
+    """
+    return float(config.CATALOG_TTL_SECONDS if config.CATALOG_TTL_SECONDS > 0 else 1)
+
+
+def _catalog_copy(state: _CatalogState, feature: str) -> list[dict[str, Any]] | None:
+    """Return the catalog that was fetched last, if there is one.
+
+    Args:
+        state: The cache state of a feature.
+        feature: The feature identifier.
+
+    Returns:
+        list[dict[str, Any]] | None: The catalog entries, or None when no
+        catalog was ever fetched.
+    """
+    if state.entries is None:
+        return None
+    logger.info("serving the last known model catalog for feature %s", feature)
+    return list(state.entries)
+
+
+def fetch_catalog(feature: str) -> list[dict[str, Any]] | None:
+    """Fetch the catalog of one feature.
+
+    The last catalog that was fetched successfully is served when the upstream
+    fails, so that one blip does not empty the catalog for the whole TTL. A
+    failure is never cached as an empty catalog.
+
+    Args:
+        feature: The feature identifier.
+
+    Returns:
+        list[dict[str, Any]] | None: The catalog entries, or None when the
+        catalog is unavailable and no good copy was ever fetched.
+    """
+    state = _catalog_state(feature)
+    now = time.time()
+    if state.entries is not None and now - state.fetched_at < _catalog_ttl():
+        return list(state.entries)
+    if state.failed_at and now - state.failed_at < _catalog_retry():
+        # A recent attempt failed; the upstream is not asked again yet.
+        return _catalog_copy(state, feature)
+
+    # Only one thread fetches a feature at a time, so that a burst of
+    # requests causes one upstream call. A caller that has a copy to serve
+    # does not wait for the fetch that is already running.
+    if not state.lock.acquire(blocking=state.entries is None):
+        return _catalog_copy(state, feature)
+    try:
+        now = time.time()
+        if state.entries is not None and now - state.fetched_at < _catalog_ttl():
+            return list(state.entries)
+        if state.failed_at and now - state.failed_at < _catalog_retry():
+            # The attempt that held the lock failed; do not start another one.
+            return _catalog_copy(state, feature)
+        try:
+            entries = _request_catalog(feature)
+        except requests.RequestException as exc:
+            state.failed_at = time.time()
+            logger.warning(
+                "failed to fetch model catalog for feature %s: %s", feature, exc
+            )
+            return _catalog_copy(state, feature)
+        except ValueError:
+            state.failed_at = time.time()
+            logger.warning(
+                "failed to parse model catalog response for feature %s", feature
+            )
+            return _catalog_copy(state, feature)
+        state.entries = entries
+        state.fetched_at = time.time()
+        state.failed_at = 0.0
+        return list(entries)
+    finally:
+        state.lock.release()
+
+
+def chat_models() -> list[dict[str, Any]] | None:
     """Fetch chat models from the model catalog.
 
     Returns:
-        list[dict[str, Any]]: List of chat models.
+        list[dict[str, Any]] | None: List of chat models, or None when the
+        catalog is unavailable.
     """
     return fetch_catalog("UNIFY_CHAT_WITH_AI")
 
@@ -327,38 +672,30 @@ def model_id(entry: dict[str, Any]) -> str:
 
 
 # 7. Vision and Image Model ID Sets Cache Optimization (frozenset)
-@lru_cache(maxsize=32)
-def vision_model_ids_cached(_bucket: int) -> frozenset[str]:
-    """Retrieve and cache vision model IDs for the active cache bucket."""
-    return frozenset(
-        model_id(entry) for entry in fetch_catalog("CHAT_WITH_IMAGE") if model_id(entry)
-    )
-
-
-def vision_model_ids() -> frozenset[str]:
-    """Retrieve current set of vision model IDs.
+def vision_model_ids() -> frozenset[str] | None:
+    """Retrieve the current set of vision model IDs.
 
     Returns:
-        frozenset[str]: Set of model IDs supporting image inputs.
+        frozenset[str] | None: Set of model IDs supporting image inputs, or
+        None when the catalog is unavailable.
     """
-    return vision_model_ids_cached(cache_bucket())
+    catalog = fetch_catalog("CHAT_WITH_IMAGE")
+    if catalog is None:
+        return None
+    return frozenset(model_id(entry) for entry in catalog if model_id(entry))
 
 
-@lru_cache(maxsize=32)
-def image_model_ids_cached(_bucket: int) -> frozenset[str]:
-    """Retrieve and cache image generator model IDs for the active cache bucket."""
-    return frozenset(
-        model_id(entry) for entry in fetch_catalog("IMAGE_GENERATOR") if model_id(entry)
-    )
-
-
-def image_model_ids() -> frozenset[str]:
-    """Retrieve current set of image model IDs.
+def image_model_ids() -> frozenset[str] | None:
+    """Retrieve the current set of image model IDs.
 
     Returns:
-        frozenset[str]: Set of model IDs supporting image generation.
+        frozenset[str] | None: Set of model IDs supporting image generation,
+        or None when the catalog is unavailable.
     """
-    return image_model_ids_cached(cache_bucket())
+    catalog = fetch_catalog("IMAGE_GENERATOR")
+    if catalog is None:
+        return None
+    return frozenset(model_id(entry) for entry in catalog if model_id(entry))
 
 
 def error_response(
@@ -427,15 +764,34 @@ def request_json() -> dict[str, Any] | tuple[Response, int]:
         dict[str, Any] | tuple[Response, int]: Parsed JSON dict or Flask error response.
     """
     # 12. Improved Empty Request Body Parsing
-    if not request.data:
+    limit = config.MAX_REQUEST_BYTES
+    # A body that declares its length is refused before it is read.
+    if request.content_length is not None and request.content_length > limit:
+        return error_response(
+            f"The request body is larger than {limit} bytes.",
+            413,
+            "request_too_large",
+        )
+    # The body is read from the raw input with a limit of its own. The
+    # framework does not limit a body whose length is not declared, so the
+    # excess would go unnoticed without it.
+    raw = request.environ.get("wsgi.input")
+    body = raw.read(limit + 1) if raw is not None else b""
+    if len(body) > limit:
+        return error_response(
+            f"The request body is larger than {limit} bytes.",
+            413,
+            "request_too_large",
+        )
+    if not body:
         return error_response(
             "Empty request body. Please provide a valid JSON object.",
             400,
             "empty_request_body",
         )
     try:
-        data = request.get_json(force=True)
-    except BadRequest:
+        data = json.loads(body)
+    except ValueError:
         return error_response("Invalid JSON body.", 400, "invalid_json")
     if not isinstance(data, dict):
         return error_response(
@@ -619,8 +975,22 @@ def parse_tool_text(text: str, tools: list[dict[str, Any]]) -> dict[str, Any] | 
     return None
 
 
+CRAWL_MARKER = "🌐 Crawling site "
+
+# The most text held back, in characters, while it is still undecided whether
+# the current line is a crawl-status line. The holdback is what lets the
+# filter see the marker after any leading space, so it is generous; a line
+# that is still undecided when it is longer than this is let through rather
+# than held.
+CRAWL_HOLDBACK_MAX = 8192
+
+
 def clean_text(text: str) -> str:
     """Clean specific crawl status lines from output text.
+
+    This is the whole-text path, used where the complete response is
+    available. The streaming path filters at line boundaries instead and
+    keeps the text byte for byte.
 
     Args:
         text: The text to clean.
@@ -629,11 +999,103 @@ def clean_text(text: str) -> str:
         str: Cleaned text content.
     """
     lines = [
-        line
-        for line in text.splitlines()
-        if not line.strip().startswith("🌐 Crawling site ")
+        line for line in text.splitlines() if not line.strip().startswith(CRAWL_MARKER)
     ]
     return "\n".join(lines).strip()
+
+
+def _is_crawl_line(text: str) -> bool:
+    """Return True when a line is a crawl-status line that must be dropped.
+
+    Args:
+        text: One line, without its terminator.
+
+    Returns:
+        bool: True if the line must not reach the client.
+    """
+    return text.strip().startswith(CRAWL_MARKER)
+
+
+def _crawl_decision(text: str) -> str:
+    """Classify a line that is still being received.
+
+    A line is a crawl-status line when its first non-space characters are the
+    crawl marker. While the text seen so far still matches that marker, more
+    text could turn it into a crawl-status line, so the answer stays
+    undecided and the line is held back.
+
+    Args:
+        text: The part of the line received so far.
+
+    Returns:
+        str: "crawl" when the line is a crawl-status line, "clear" when it
+        cannot be one, and "undecided" while more text could change that.
+    """
+    stripped = text.lstrip()
+    if not stripped:
+        return "undecided"
+    if stripped.startswith(CRAWL_MARKER):
+        # The marker is there. It counts only when non-space text follows it,
+        # because the marker on its own is not a crawl-status line.
+        return "crawl" if stripped[len(CRAWL_MARKER) :].strip() else "undecided"
+    if CRAWL_MARKER.startswith(stripped):
+        return "undecided"
+    return "clear"
+
+
+def _drop_crawl_lines(text: str, at_line_start: bool) -> str:
+    """Drop the crawl-status lines among the complete lines of a text.
+
+    The text may hold more than one line, which happens when a tool call was
+    never finished and the line splitting was skipped. The first line is only
+    a crawl-status line when it really begins a line.
+
+    Args:
+        text: Text that holds complete lines and a trailing partial line.
+        at_line_start: Whether the first line of the text begins a line.
+
+    Returns:
+        str: The text without its crawl-status lines.
+    """
+    if "\n" not in text:
+        if at_line_start and _is_crawl_line(text):
+            return ""
+        return text
+    head, _, partial = text.rpartition("\n")
+    kept: list[str] = []
+    for index, line in enumerate(head.split("\n")):
+        if _is_crawl_line(line) and (at_line_start or index > 0):
+            continue
+        kept.append(line)
+    result = "\n".join(kept)
+    if kept:
+        result += "\n"
+    # The last line has no terminator, but it still begins a line, so a
+    # crawl-status line among them is dropped as well.
+    if partial and not _is_crawl_line(partial):
+        result += partial
+    return result
+
+
+def _find_line_end(text: str) -> tuple[int, int]:
+    """Find the next line terminator in text.
+
+    Only "\n" ends a line here. The other characters ``str.splitlines`` treats
+    as line breaks are not terminators, so the text the client receives keeps
+    them, and a line that starts with a carriage return is still the line it
+    belongs to.
+
+    Args:
+        text: Text to search.
+
+    Returns:
+        tuple[int, int]: Where the terminator starts and how long it is, or
+        (-1, 0) when the text holds no terminator.
+    """
+    newline = text.find("\n")
+    if newline == -1:
+        return -1, 0
+    return newline, 1
 
 
 def tool_message(tool_call: dict[str, Any]) -> dict[str, Any]:
@@ -1089,6 +1551,13 @@ def decode_data_image(image_url: str) -> BytesIO | tuple[Response, int]:
         encoded = image_url.split(",", 1)[1]
     except IndexError:
         return error_response("Invalid image data URL.", 400, "invalid_image")
+    # The encoded text is measured before it is decoded, so a payload that is
+    # far over the limit is never turned into bytes in memory. The bound is
+    # the longest text a payload of the limit can have, rounded up to a whole
+    # quantum, because a payload of one or two bytes more can have the same
+    # text length.
+    if len(encoded) > 4 * ((config.MAX_IMAGE_BYTES + 4) // 3):
+        return error_response("Image payload is too large.", 413, "image_too_large")
     try:
         payload = base64.b64decode(encoded, validate=True)
     except (binascii.Error, ValueError):
@@ -1165,7 +1634,14 @@ def upload_images(
     """
     if not image_urls:
         return []
-    if model not in vision_model_ids():
+    vision_ids = vision_model_ids()
+    if vision_ids is None:
+        return error_response(
+            "The model catalog is temporarily unavailable.",
+            503,
+            "catalog_unavailable",
+        )
+    if model not in vision_ids:
         return error_response(
             f"This model does not support image inputs: {model}",
             400,
@@ -1182,7 +1658,8 @@ def upload_images(
             return binary_data
 
         # Use connection pool session and propagated headers
-        upload = get_session().post(
+        upload = post_upstream(
+            "asset",
             asset_api_url(),
             files={"asset": (f"gateway-{uuid.uuid4()}.png", binary_data, "image/png")},
             headers={"API-KEY": api_key, **propagated_headers()},
@@ -1221,7 +1698,10 @@ def build_payload(
     model = data.get("model", config.DEFAULT_CHAT_MODEL)
 
     # 19. Enhanced Model Warning Traces
-    if model not in {model_id(m) for m in chat_models() if model_id(m)}:
+    catalog = chat_models()
+    if catalog is not None and model not in {
+        model_id(m) for m in catalog if model_id(m)
+    }:
         logger.warning(
             "Requested model '%s' is not listed in active models catalog.", model
         )
@@ -1462,6 +1942,13 @@ def models() -> tuple[Response, int]:
     Returns:
         tuple[Response, int]: OpenAI-compatible model listing.
     """
+    catalog = chat_models()
+    if catalog is None:
+        return error_response(
+            "The model catalog is temporarily unavailable.",
+            503,
+            "catalog_unavailable",
+        )
     return jsonify(
         {
             "object": "list",
@@ -1472,7 +1959,7 @@ def models() -> tuple[Response, int]:
                     "created": 1727389042,
                     "owned_by": "1minai",
                 }
-                for entry in chat_models()
+                for entry in catalog
                 if model_id(entry)
             ],
         }
@@ -1512,7 +1999,8 @@ def chat_completions() -> tuple[Response, int] | Response:
     model = data.get("model", config.DEFAULT_CHAT_MODEL)
     if data.get("stream"):
         # Use connection pool session
-        upstream = get_session().post(
+        upstream = post_upstream(
+            "chat",
             chat_stream_api_url(),
             data=json.dumps(payload),
             headers=headers,
@@ -1531,7 +2019,8 @@ def chat_completions() -> tuple[Response, int] | Response:
         return Response(stream, content_type="text/event-stream")
 
     # Use connection pool session
-    upstream = get_session().post(
+    upstream = post_upstream(
+        "chat",
         chat_api_url(),
         json=payload,
         headers=headers,
@@ -1577,7 +2066,7 @@ def chat_completions() -> tuple[Response, int] | Response:
 
 def stream_response(
     upstream: requests.Response, data: dict[str, Any], model: str
-) -> Generator[str, None, None]:
+) -> _ClosingStream:
     """Stream response back to client with robust tool call buffering protection and standard OpenAI formats.
 
     Args:
@@ -1585,10 +2074,74 @@ def stream_response(
         data: Core user request body.
         model: Target model indicator.
 
-    Yields:
-        Generator[str, None, None]: Server-Sent Event chunk sequences.
+    Returns:
+        _ClosingStream: The event-stream chunks. Closing it closes the upstream
+        response.
     """
+    return _ClosingStream(upstream, _stream_body(upstream, data, model))
+
+
+class _ClosingStream:
+    """Iterator over the event-stream chunks that closes the upstream response.
+
+    Werkzeug closes the iterable it is given when the request ends. A plain
+    generator runs its cleanup only once it has started, so the upstream
+    response is closed here as well: this wrapper closes it even when it is
+    closed before the first chunk has been read.
+    """
+
+    def __init__(
+        self, upstream: requests.Response, chunks: Generator[str, None, None]
+    ) -> None:
+        """Store the upstream response and the chunk iterator.
+
+        Args:
+            upstream: The upstream response to close.
+            chunks: The iterator producing the event-stream chunks.
+        """
+        self._upstream = upstream
+        self._chunks = chunks
+        self._closed = False
+
+    def __iter__(self) -> _ClosingStream:
+        """Return this iterator.
+
+        Returns:
+            _ClosingStream: This iterator.
+        """
+        return self
+
+    def __next__(self) -> str:
+        """Return the next event-stream chunk.
+
+        The upstream response is closed when the stream ends or fails, so the
+        connection is never left open.
+
+        Returns:
+            str: The next chunk.
+        """
+        try:
+            return next(self._chunks)
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        """Close the chunk iterator and the upstream response."""
+        if self._closed:
+            return
+        self._closed = True
+        self._chunks.close()
+        self._upstream.close()
+
+
+def _stream_body(
+    upstream: requests.Response, data: dict[str, Any], model: str
+) -> Generator[str, None, None]:
+    """Yield the event-stream chunks for the upstream response."""
     buffered_text = ""
+    at_line_start = True
+    dropping_line = False
     tail_size = 200
     current_event = None
     stream_id = f"chatcmpl-{uuid.uuid4()}"
@@ -1704,6 +2257,9 @@ def stream_response(
                     call = parse_tool_text(buffered_text, tools)
                     if call:
                         yield from emit_tool_call(call)
+                        # The gateway stops reading the upstream here, so the
+                        # response is released now.
+                        upstream.close()
                         yield "data: [DONE]\n\n"
                         return
                     else:
@@ -1712,18 +2268,64 @@ def stream_response(
                     in_tool_buffering = False
 
             if not in_tool_buffering:
-                if len(buffered_text) > tail_size:
-                    flush = buffered_text[:-tail_size]
-                    if flush:
-                        cleaned = clean_text(flush)
-                        chunk = emit_content_chunk(cleaned)
+                # Emit every complete line. The crawl-status filter only sees
+                # lines that really begin a line: the buffer can start in the
+                # middle of one, and such a fragment is never a crawl-status
+                # line and is never dropped.
+                while True:
+                    index, length = _find_line_end(buffered_text)
+                    if index == -1:
+                        break
+                    line = buffered_text[:index]
+                    terminator = buffered_text[index : index + length]
+                    buffered_text = buffered_text[index + length :]
+                    if dropping_line:
+                        dropping_line = False
+                    elif not (at_line_start and _is_crawl_line(line)):
+                        chunk = emit_content_chunk(line + terminator)
                         if chunk:
                             yield chunk
-                    buffered_text = buffered_text[-tail_size:]
+                    at_line_start = True
 
-    text = clean_text(buffered_text)
-    if text:
-        chunk = emit_content_chunk(text)
+                if dropping_line:
+                    # The crawl-status line continues and its text is dropped.
+                    # The last part of it is kept, so that a tool call on the
+                    # same line is still detected instead of vanishing with the
+                    # line.
+                    if len(buffered_text) > tail_size:
+                        buffered_text = buffered_text[-tail_size:]
+                        at_line_start = False
+                else:
+                    keep = tail_size
+                    if at_line_start:
+                        decision = _crawl_decision(buffered_text)
+                        if decision == "crawl":
+                            # The line is a crawl-status line: drop it.
+                            dropping_line = True
+                            keep = len(buffered_text)
+                        elif decision == "undecided":
+                            # The line may still become a crawl-status line, so
+                            # hold it back. The cap keeps the buffer bounded.
+                            keep = min(len(buffered_text), CRAWL_HOLDBACK_MAX)
+                    if len(buffered_text) > keep:
+                        cut = len(buffered_text) - keep
+                        chunk = emit_content_chunk(buffered_text[:cut])
+                        if chunk:
+                            yield chunk
+                        buffered_text = buffered_text[cut:]
+                        # The cut is inside a line, so the buffer no longer
+                        # starts at a line beginning.
+                        at_line_start = False
+
+    if dropping_line:
+        # The stream ended inside a crawl-status line.
+        buffered_text = ""
+    elif buffered_text:
+        # The buffer can hold more than one line when a tool call was never
+        # finished, so the crawl-status lines among them are dropped here too.
+        buffered_text = _drop_crawl_lines(buffered_text, at_line_start)
+    if buffered_text:
+        chunk = emit_content_chunk(buffered_text)
         if chunk:
             yield chunk
 
@@ -1765,20 +2367,28 @@ def image_generations() -> tuple[Response, int]:
     data = request_json()
     if isinstance(data, tuple):
         return data
+    prompt = data.get("prompt")
+    if not prompt:
+        return error_response("No prompt provided.", 400, "invalid_request_error")
+
     model = data.get("model", config.DEFAULT_IMAGE_MODEL)
-    if model not in image_model_ids():
+    image_ids = image_model_ids()
+    if image_ids is None:
+        return error_response(
+            "The model catalog is temporarily unavailable.",
+            503,
+            "catalog_unavailable",
+        )
+    if model not in image_ids:
         return error_response(
             f"This model does not support image generation: {model}",
             400,
             "model_not_supported",
         )
 
-    prompt = data.get("prompt")
-    if not prompt:
-        return error_response("No prompt provided.", 400, "invalid_request_error")
-
     # Use connection pool session and custom header propagation
-    upstream = get_session().post(
+    upstream = post_upstream(
+        "images",
         feature_api_url() + "?isStreaming=false",
         json={
             "type": "IMAGE_GENERATOR",
@@ -1823,6 +2433,11 @@ def create_app() -> Flask:
     """
     app = Flask(__name__)
     app.url_map.strict_slashes = False
+    # A backstop for anything that reads the body through the framework. The
+    # application reads the raw input with a limit of its own, so that a body
+    # which declares no length is refused as well. The handler below answers
+    # with the OpenAI error shape when the framework trips this limit.
+    app.config["MAX_CONTENT_LENGTH"] = config.MAX_REQUEST_BYTES
 
     # 11. Relocate global logging initialization inside create_app
     configure_logging()
@@ -1865,6 +2480,25 @@ def create_app() -> Flask:
         return response
 
     # 5. Global Exception JSON Error Handler
+    @app.errorhandler(RequestEntityTooLarge)
+    def handle_request_too_large(exc: RequestEntityTooLarge) -> tuple[Response, int]:
+        """Answer a request body that is larger than the gateway accepts.
+
+        Args:
+            exc: The exception raised by the request parser.
+
+        Returns:
+            tuple[Response, int]: The OpenAI-shaped error response.
+        """
+        logger.warning(
+            "rejected a request body larger than %d bytes", config.MAX_REQUEST_BYTES
+        )
+        return error_response(
+            f"The request body is larger than {config.MAX_REQUEST_BYTES} bytes.",
+            413,
+            "request_too_large",
+        )
+
     @app.errorhandler(Exception)
     def handle_exception(exc: Exception) -> tuple[Response, int]:
         logger.exception("Unhandled error occurred in gateway: %s", exc)
@@ -1891,7 +2525,16 @@ def main() -> None:
     logger.info(
         "one-min-ai-gateway starting on %s:%s via CLI", config.HOST, config.PORT
     )
-    serve(app, host=config.HOST, port=config.PORT, threads=config.WAITRESS_THREADS)
+    serve(
+        app,
+        host=config.HOST,
+        port=config.PORT,
+        threads=config.WAITRESS_THREADS,
+        # The limit of the server in front is a little larger than the limit of
+        # the application, so that the application refuses the body and the
+        # answer carries the OpenAI error shape.
+        max_request_body_size=config.MAX_REQUEST_BYTES + 1024 * 1024,
+    )
 
 
 if __name__ == "__main__":
