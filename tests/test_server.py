@@ -856,9 +856,13 @@ def test_a_stream_reports_the_usage_when_the_caller_asks_for_it(monkeypatch):
     assert usage_frame["model"] == content_frame["model"]
     assert usage_frame["created"] == content_frame["created"]
 
+    # The prompt and the answer are counted apart.
+    # The prompt and the answer are counted apart: the answer is the text the
+    # gateway sent.
     usage = usage_frame["usage"]
+    assert usage["completion_tokens"] == server.token_count("hello world")
     assert usage["prompt_tokens"] > 0
-    assert usage["completion_tokens"] > 0
+    assert usage["prompt_tokens"] != usage["completion_tokens"]
     assert usage["total_tokens"] == (
         usage["prompt_tokens"] + usage["completion_tokens"]
     )
@@ -996,3 +1000,25 @@ def test_include_usage_must_be_true(monkeypatch):
 
     assert response.status_code == 200
     assert '"usage"' not in response.get_data(as_text=True)
+
+
+def test_a_run_of_text_that_is_too_long_to_carry_is_counted_once():
+    """A very long unbroken run does not grow the counter without bound."""
+    counter = server._TokenCounter()
+    payload = "x" * (server.MAX_TOKEN_LENGTH * 4)
+
+    counter.add(payload)
+
+    # The run is counted as one piece, not carried for ever.
+    assert counter.total() >= 1
+    assert counter.total() <= 4
+
+
+def test_the_carried_text_stays_bounded():
+    """The counter does not carry more than the limit."""
+    counter = server._TokenCounter()
+
+    for _ in range(10):
+        counter.add("y" * 10000)
+
+    assert len(counter._carry) <= server.MAX_TOKEN_LENGTH

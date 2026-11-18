@@ -1291,14 +1291,16 @@ def stream_with_usage(
     counter = _TokenCounter()
     stream_id = ""
     model = ""
-    created = int(time.time())
+    created = 0
     try:
         for chunk in chunks:
-            text, chunk_id, chunk_model = _chunk_parts(chunk)
+            text, chunk_id, chunk_model, chunk_created = _chunk_parts(chunk)
             if chunk_id:
                 stream_id = chunk_id
             if chunk_model:
                 model = chunk_model
+            if chunk_created:
+                created = chunk_created
             if chunk.startswith("data: [DONE]"):
                 completion_tokens = counter.total()
                 yield (
@@ -1332,24 +1334,25 @@ def stream_with_usage(
             close()
 
 
-def _chunk_parts(chunk: str) -> tuple[str, str, str]:
+def _chunk_parts(chunk: str) -> tuple[str, str, str, int]:
     """Read an event-stream chunk.
 
     Args:
         chunk: One event-stream chunk.
 
     Returns:
-        tuple[str, str, str]: The text of the chunk (empty when it carries
-        none), the id of the completion it belongs to and the model it names.
+        tuple[str, str, str, int]: The text of the chunk (empty when it
+        carries none), the id of the completion it belongs to, the model it
+        names and the time the completion was created.
     """
     if not chunk.startswith("data: ") or chunk.startswith("data: [DONE]"):
-        return "", "", ""
+        return "", "", "", 0
     try:
         body = json.loads(chunk[len("data: ") :].strip())
     except json.JSONDecodeError:
-        return "", "", ""
+        return "", "", "", 0
     if not isinstance(body, dict):
-        return "", "", ""
+        return "", "", "", 0
     text = ""
     choices = body.get("choices")
     if isinstance(choices, list):
@@ -1359,7 +1362,13 @@ def _chunk_parts(chunk: str) -> tuple[str, str, str]:
             delta = choice.get("delta")
             if isinstance(delta, dict):
                 text += str(delta.get("content") or "")
-    return text, str(body.get("id") or ""), str(body.get("model") or "")
+    created = body.get("created")
+    return (
+        text,
+        str(body.get("id") or ""),
+        str(body.get("model") or ""),
+        created if isinstance(created, int) else 0,
+    )
 
 
 def token_count(text: str) -> int:
