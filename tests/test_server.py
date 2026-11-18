@@ -1,4 +1,5 @@
 import json
+import threading
 import time
 from typing import Any, Generator
 import pytest
@@ -621,8 +622,6 @@ def test_catalog_failure_is_retried_after_a_short_backoff(monkeypatch):
 
 def test_catalog_fetches_a_feature_once_under_concurrent_requests(monkeypatch):
     """Concurrent requests for one feature cause one upstream call."""
-    import threading
-
     session = FakeCatalogSession([{"id": "gpt-4o"}])
     monkeypatch.setattr(server, "get_session", lambda: session)
 
@@ -697,7 +696,7 @@ def test_chat_completions_work_while_the_catalog_is_unavailable(monkeypatch):
     assert response.status_code == 200
 
 
-def test_cache_stampede_protection_lock():
+def test_one_feature_is_fetched_by_one_thread_at_a_time():
     """Verify a feature is fetched by one thread at a time."""
     state = server._catalog_state("UNIFY_CHAT_WITH_AI")
     assert not state.lock.locked()
@@ -973,8 +972,6 @@ def test_an_empty_catalog_that_was_fetched_is_cached(monkeypatch):
 
 def test_a_failing_upstream_is_asked_once_for_a_burst_of_requests(monkeypatch):
     """A burst against a failing upstream causes one upstream call."""
-    import threading
-
     session = FakeCatalogSession([])
     monkeypatch.setattr(server, "get_session", lambda: session)
     session.failing = True
@@ -998,8 +995,6 @@ def test_a_failing_upstream_is_asked_once_for_a_burst_of_requests(monkeypatch):
 
 def test_one_slow_feature_does_not_block_another(monkeypatch):
     """A feature that is slow to fetch does not hold up the other features."""
-    import threading
-
     holding = threading.Event()
 
     class SlowSession:
@@ -1122,3 +1117,156 @@ def test_a_malformed_catalog_response_is_reported_when_there_is_no_copy(monkeypa
     response = client.get("/v1/models")
     assert response.status_code == 503
     assert response.json["error"]["code"] == "catalog_unavailable"
+
+
+def test_the_catalog_is_asked_again_once_it_expires(monkeypatch):
+    """A catalog that has expired is fetched again, not frozen."""
+    session = FakeCatalogSession([{"id": "gpt-4o"}])
+    monkeypatch.setattr(server, "get_session", lambda: session)
+
+    assert server.fetch_catalog("IMAGE_GENERATOR") == [{"id": "gpt-4o"}]
+    assert session.calls == 1
+
+    # The catalog has expired.
+    server._catalog_state("IMAGE_GENERATOR").fetched_at = 0.0
+
+    assert server.fetch_catalog("IMAGE_GENERATOR") == [{"id": "gpt-4o"}]
+    assert session.calls == 2
+
+
+def test_a_caller_with_a_copy_does_not_wait_for_a_running_fetch(monkeypatch):
+    """A caller that has a copy is served while the upstream is being asked."""
+    session = FakeCatalogSession([{"id": "gpt-4o"}])
+    monkeypatch.setattr(server, "get_session", lambda: session)
+
+    assert server.fetch_catalog("IMAGE_GENERATOR") == [{"id": "gpt-4o"}]
+
+    state = server._catalog_state("IMAGE_GENERATOR")
+    state.fetched_at = 0.0
+    holding = threading.Event()
+    release = threading.Event()
+
+    class SlowSession:
+        def get(self, *args: Any, **kwargs: Any) -> FakeHTTPResponse:
+            holding.set()
+            release.wait(5)
+            return FakeHTTPResponse(text=json.dumps({"models": [{"id": "gpt-4o"}]}))
+
+    monkeypatch.setattr(server, "get_session", lambda: SlowSession())
+
+    answered: list[Any] = []
+
+    def caller() -> None:
+        answered.append(server.fetch_catalog("IMAGE_GENERATOR"))
+
+    thread = threading.Thread(target=caller)
+    thread.start()
+    assert holding.wait(5)
+
+    # The copy is served while the fetch is still running.
+    quick = threading.Thread(
+        target=lambda: answered.append(server.fetch_catalog("IMAGE_GENERATOR"))
+    )
+    quick.start()
+    quick.join(2)
+    assert not quick.is_alive(), "a caller with a copy waited for the fetch"
+    assert answered[-1] == [{"id": "gpt-4o"}]
+
+    release.set()
+    thread.join(5)
+
+
+def test_a_failed_fetch_is_not_asked_again_within_the_backoff(monkeypatch):
+    """A recent failure is remembered, so the upstream is not asked again."""
+    session = FakeCatalogSession([{"id": "gpt-4o"}])
+    monkeypatch.setattr(server, "get_session", lambda: session)
+
+    session.failing = True
+    assert server.fetch_catalog("IMAGE_GENERATOR") is None
+    assert session.calls == 1
+
+    # Inside the backoff window the upstream is left alone.
+    assert server.fetch_catalog("IMAGE_GENERATOR") is None
+    assert session.calls == 1
+
+
+def test_a_retry_interval_of_zero_means_one_second(monkeypatch):
+    """A backoff of zero or less means one second, not every request."""
+    monkeypatch.setattr(server.config, "CATALOG_RETRY_SECONDS", 0)
+    assert server._catalog_retry() == 1.0
+
+    monkeypatch.setattr(server.config, "CATALOG_RETRY_SECONDS", -5)
+    assert server._catalog_retry() == 1.0
+
+    monkeypatch.setattr(server.config, "CATALOG_RETRY_SECONDS", 10)
+    assert server._catalog_retry() == 10.0
+
+
+def test_a_caller_with_a_fresh_copy_does_not_wait_for_a_running_fetch(monkeypatch):
+    """A caller with a fresh copy is served without taking the lock."""
+    session = FakeCatalogSession([{"id": "gpt-4o"}])
+    monkeypatch.setattr(server, "get_session", lambda: session)
+
+    assert server.fetch_catalog("IMAGE_GENERATOR") == [{"id": "gpt-4o"}]
+
+    state = server._catalog_state("IMAGE_GENERATOR")
+    holding = threading.Event()
+    release = threading.Event()
+
+    class SlowSession:
+        def get(self, *args: Any, **kwargs: Any) -> FakeHTTPResponse:
+            holding.set()
+            release.wait(5)
+            return FakeHTTPResponse(text=json.dumps({"models": [{"id": "gpt-4o"}]}))
+
+    monkeypatch.setattr(server, "get_session", lambda: SlowSession())
+
+    # The fetch of the feature is running and holds its lock.
+    state.fetched_at = 0.0
+    holding = threading.Event()
+    release = threading.Event()
+
+    def hold_the_lock() -> None:
+        with state.lock:
+            holding.set()
+            release.wait(5)
+
+    holder = threading.Thread(target=hold_the_lock)
+    holder.start()
+    assert holding.wait(5)
+    try:
+        answered = server.fetch_catalog("IMAGE_GENERATOR")
+    finally:
+        release.set()
+        holder.join(5)
+
+    assert answered == [{"id": "gpt-4o"}]
+
+
+def test_a_caller_after_a_failure_does_not_wait_for_a_running_fetch(monkeypatch):
+    """A recent failure is answered without taking the lock."""
+    session = FakeCatalogSession([{"id": "gpt-4o"}])
+    monkeypatch.setattr(server, "get_session", lambda: session)
+
+    session.failing = True
+    assert server.fetch_catalog("IMAGE_GENERATOR") is None
+
+    state = server._catalog_state("IMAGE_GENERATOR")
+    holding = threading.Event()
+    release = threading.Event()
+
+    def hold_the_lock() -> None:
+        with state.lock:
+            holding.set()
+            release.wait(5)
+
+    holder = threading.Thread(target=hold_the_lock)
+    holder.start()
+    assert holding.wait(5)
+    try:
+        answered = server.fetch_catalog("IMAGE_GENERATOR")
+    finally:
+        release.set()
+        holder.join(5)
+
+    assert answered is None
