@@ -430,9 +430,6 @@ def request_json() -> dict[str, Any] | tuple[Response, int]:
         dict[str, Any] | tuple[Response, int]: Parsed JSON dict or Flask error response.
     """
     # 12. Improved Empty Request Body Parsing
-    # The body is read with a limit of its own. The declared length is
-    # refused by the framework, but a request that declares no length would
-    # otherwise be read to its end.
     limit = config.MAX_REQUEST_BYTES
     # A body that declares its length is refused before it is read.
     if request.content_length is not None and request.content_length > limit:
