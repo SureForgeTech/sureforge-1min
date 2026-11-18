@@ -621,10 +621,11 @@ def parse_tool_text(text: str, tools: list[dict[str, Any]]) -> dict[str, Any] | 
 
 CRAWL_MARKER = "🌐 Crawling site "
 
-# The most text held back while it is still undecided whether the current line
-# is a crawl-status line. The holdback is what lets the filter see the marker
-# after any leading space, so it is generous; a crawl-status line that is
-# longer than this is let through rather than held.
+# The most text held back, in characters, while it is still undecided whether
+# the current line is a crawl-status line. The holdback is what lets the
+# filter see the marker after any leading space, so it is generous; a line
+# that is still undecided when it is longer than this is let through rather
+# than held.
 CRAWL_HOLDBACK_MAX = 8192
 
 
@@ -713,7 +714,11 @@ def _drop_crawl_lines(text: str, at_line_start: bool) -> str:
     result = "\n".join(kept)
     if kept:
         result += "\n"
-    return result + partial
+    # The last line has no terminator, but it still begins a line, so a
+    # crawl-status line among them is dropped as well.
+    if partial and not _is_crawl_line(partial):
+        result += partial
+    return result
 
 
 def _find_line_end(text: str) -> tuple[int, int]:

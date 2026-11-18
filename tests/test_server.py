@@ -1100,3 +1100,19 @@ def test_a_crawl_status_line_after_a_long_run_of_spaces_is_dropped():
 
     assert "Crawling" not in received
     assert "hidden" not in received
+
+
+def test_a_crawl_status_line_at_the_end_without_a_newline_is_dropped():
+    """A crawl-status line that ends the answer without a newline is dropped."""
+    text = "<tool_call\n\U0001f310 Crawling site https://x"
+
+    class FakeResponse:
+        def iter_lines(self, decode_unicode=False):
+            return [f"data: {json.dumps({'delta': {'content': text}})}".encode("utf-8")]
+
+        def close(self):
+            pass
+
+    received = _streamed_content(server.stream_response(FakeResponse(), {}, "m"))
+
+    assert received == "<tool_call\n"
