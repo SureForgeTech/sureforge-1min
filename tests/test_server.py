@@ -834,6 +834,14 @@ def _upstream_reply(text: str = "hi") -> FakeHTTPResponse:
     )
 
 
+@pytest.fixture(autouse=True)
+def pinned_retry_settings(monkeypatch):
+    """Hold the retry settings at their defaults, whatever the environment says."""
+    monkeypatch.setattr(server.config, "MAX_UPSTREAM_RETRIES", 2)
+    monkeypatch.setattr(server.config, "UPSTREAM_RETRY_BACKOFF_SECONDS", 0.25)
+    monkeypatch.setattr(server.config, "UPSTREAM_RETRY_MAX_SECONDS", 5.0)
+
+
 def test_a_request_the_upstream_declined_is_sent_again(monkeypatch):
     """A 503 means the request was not handled, so it is sent again."""
     session = SequenceSession(
@@ -1269,7 +1277,27 @@ def test_the_retry_settings_do_not_depend_on_the_environment(monkeypatch):
     assert waits == [0.25]
 
 
-def test_a_setting_that_is_not_a_number_does_not_stop_the_gateway():
+def test_a_setting_that_is_not_a_number_does_not_stop_the_gateway(monkeypatch):
     """An unreadable setting falls back to its default."""
-    assert server._int_setting("A_SETTING_THAT_DOES_NOT_EXIST", 7) == 7
-    assert server._float_setting("A_SETTING_THAT_DOES_NOT_EXIST", 1.5) == 1.5
+    monkeypatch.setenv("MAX_UPSTREAM_RETRIES", "not-a-number")
+    monkeypatch.setenv("UPSTREAM_RETRY_BACKOFF_SECONDS", "0.25s")
+    monkeypatch.setenv("UPSTREAM_RETRY_MAX_SECONDS", "")
+
+    assert server._int_setting("MAX_UPSTREAM_RETRIES", 2) == 2
+    assert server._float_setting("UPSTREAM_RETRY_BACKOFF_SECONDS", 0.25) == 0.25
+    assert server._float_setting("UPSTREAM_RETRY_MAX_SECONDS", 5) == 5
+
+
+def test_only_the_declined_statuses_are_sent_again():
+    """Only 429 and 503 mean the request was not handled."""
+    assert server.RETRY_STATUS_CODES == {429, 503}
+
+
+def test_a_file_in_a_list_is_found():
+    """The file of a list of values is found as well."""
+    stream = BytesIO(b"payload")
+    value = ("asset", ("a.png", stream, "image/png"))
+
+    assert server._file_stream(value) is stream
+    assert server._file_stream([value]) is stream
+    assert server._file_stream("just a name") is None

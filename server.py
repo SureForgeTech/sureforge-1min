@@ -60,7 +60,9 @@ def _int_setting(name: str, default: int) -> int:
     try:
         return int(os.getenv(name, str(default)))
     except ValueError:
-        logger.warning("the %s setting is not a number; using %d", name, default)
+        logging.getLogger("one-min-ai-gateway").warning(
+            "the %s setting is not a number; using %d", name, default
+        )
         return default
 
 
@@ -75,10 +77,18 @@ def _float_setting(name: str, default: float) -> float:
         float: The value of the setting.
     """
     try:
-        return float(os.getenv(name, str(default)))
+        value = float(os.getenv(name, str(default)))
     except ValueError:
-        logger.warning("the %s setting is not a number; using %s", name, default)
+        logging.getLogger("one-min-ai-gateway").warning(
+            "the %s setting is not a number; using %s", name, default
+        )
         return default
+    if not math.isfinite(value):
+        logging.getLogger("one-min-ai-gateway").warning(
+            "the %s setting is not a finite number; using %s", name, default
+        )
+        return default
+    return value
 
 
 # 13. Centralized GatewayConfig Class
@@ -334,7 +344,7 @@ def _rewind_files(kwargs: dict[str, Any], quiet: bool = False) -> bool:
             return False
         try:
             seek(0)
-        except (OSError, ValueError):
+        except (OSError, ValueError, TypeError):
             if not quiet:
                 logger.warning("could not rewind a file that is sent again")
             return False
