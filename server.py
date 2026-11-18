@@ -47,6 +47,40 @@ from werkzeug.http import HTTP_STATUS_CODES
 from waitress import serve
 
 
+def _int_setting(name: str, default: int) -> int:
+    """Read an integer setting, falling back to its default.
+
+    Args:
+        name: The name of the environment variable.
+        default: The value to use when the variable is missing or unreadable.
+
+    Returns:
+        int: The value of the setting.
+    """
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        logger.warning("the %s setting is not a number; using %d", name, default)
+        return default
+
+
+def _float_setting(name: str, default: float) -> float:
+    """Read a number setting, falling back to its default.
+
+    Args:
+        name: The name of the environment variable.
+        default: The value to use when the variable is missing or unreadable.
+
+    Returns:
+        float: The value of the setting.
+    """
+    try:
+        return float(os.getenv(name, str(default)))
+    except ValueError:
+        logger.warning("the %s setting is not a number; using %s", name, default)
+        return default
+
+
 # 13. Centralized GatewayConfig Class
 @dataclass
 class GatewayConfig:
@@ -65,13 +99,11 @@ class GatewayConfig:
         "yes",
     )
     CATALOG_TTL_SECONDS: int = int(os.getenv("CATALOG_TTL_SECONDS", "300"))
-    MAX_UPSTREAM_RETRIES: int = int(os.getenv("MAX_UPSTREAM_RETRIES", "2"))
-    UPSTREAM_RETRY_BACKOFF_SECONDS: float = float(
-        os.getenv("UPSTREAM_RETRY_BACKOFF_SECONDS", "0.25")
+    MAX_UPSTREAM_RETRIES: int = _int_setting("MAX_UPSTREAM_RETRIES", 2)
+    UPSTREAM_RETRY_BACKOFF_SECONDS: float = _float_setting(
+        "UPSTREAM_RETRY_BACKOFF_SECONDS", 0.25
     )
-    UPSTREAM_RETRY_MAX_SECONDS: float = float(
-        os.getenv("UPSTREAM_RETRY_MAX_SECONDS", "5")
-    )
+    UPSTREAM_RETRY_MAX_SECONDS: float = _float_setting("UPSTREAM_RETRY_MAX_SECONDS", 5)
     MAX_IMAGE_BYTES: int = int(os.getenv("MAX_IMAGE_BYTES", str(10 * 1024 * 1024)))
     CORS_ALLOW_ORIGIN: str = os.getenv("CORS_ALLOW_ORIGIN", "*")
     PORT: int = 5001
@@ -267,7 +299,7 @@ def _file_stream(value: Any) -> Any:
     return None
 
 
-def _rewind_files(kwargs: dict[str, Any]) -> bool:
+def _rewind_files(kwargs: dict[str, Any], quiet: bool = False) -> bool:
     """Move the streams of a multipart payload back to their beginning.
 
     The request library reads a file object while it builds the body, so a
@@ -276,6 +308,8 @@ def _rewind_files(kwargs: dict[str, Any]) -> bool:
 
     Args:
         kwargs: The arguments of the request.
+        quiet: Whether to leave out the messages about a file that cannot be
+        rewound. The first attempt is not one that is sent again.
 
     Returns:
         bool: False when a file cannot be rewound, so that the request must
@@ -295,12 +329,14 @@ def _rewind_files(kwargs: dict[str, Any]) -> bool:
             continue
         seek = getattr(stream, "seek", None)
         if seek is None:
-            logger.warning("a file that cannot be rewound is not sent again")
+            if not quiet:
+                logger.warning("a file that cannot be rewound is not sent again")
             return False
         try:
             seek(0)
         except (OSError, ValueError):
-            logger.warning("could not rewind a file that is sent again")
+            if not quiet:
+                logger.warning("could not rewind a file that is sent again")
             return False
     return True
 
@@ -320,7 +356,7 @@ def post_upstream(label: str, url: str, **kwargs: Any) -> requests.Response:
     Returns:
         requests.Response: The response of the last attempt.
     """
-    _rewind_files(kwargs)
+    _rewind_files(kwargs, quiet=True)
     response = get_session().post(url, **kwargs)
     for attempt in range(config.MAX_UPSTREAM_RETRIES):
         if response.status_code not in RETRY_STATUS_CODES:
@@ -332,12 +368,13 @@ def post_upstream(label: str, url: str, **kwargs: Any) -> requests.Response:
             response.status_code,
             delay,
         )
-        time.sleep(delay)
         if not _rewind_files(kwargs):
             # The file cannot be sent again, so the decline is the answer
-            # rather than an upload with nothing in it.
+            # rather than an upload with nothing in it. The caller is not held
+            # for a wait it would not use.
             logger.warning("the %s request is not sent again", label)
             break
+        time.sleep(delay)
         try:
             sent_again = get_session().post(url, **kwargs)
         except requests.RequestException:

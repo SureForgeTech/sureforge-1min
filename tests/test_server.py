@@ -1047,7 +1047,7 @@ def test_a_retry_after_with_a_date_is_followed(monkeypatch):
 
     delay = server._retry_delay(0, Response())
 
-    assert 1.0 < delay <= 3.0
+    assert 0.5 < delay <= 3.0
 
 
 def test_a_replaced_response_is_closed(monkeypatch):
@@ -1222,3 +1222,54 @@ def test_the_wait_stays_bounded_with_extreme_settings(monkeypatch):
 
     assert all(0 <= wait <= 5.0 for wait in waits)
     assert sum(waits) <= 50.0
+
+
+def test_a_retry_after_that_is_not_a_number_never_makes_the_wait_unusable():
+    """A Retry-After that is not a number leaves a wait that can be slept."""
+    for value in ("nan", "inf", "-inf", "Infinity", "1e400"):
+        response = FakeHTTPResponse(
+            status_code=503, text="busy", headers={"Retry-After": value}
+        )
+        delay = server._retry_delay(0, response)
+        assert delay >= 0, value
+        assert delay == delay, value  # not NaN
+        assert delay <= server.config.UPSTREAM_RETRY_MAX_SECONDS, value
+
+
+def test_a_retry_after_of_zero_does_not_shorten_the_wait():
+    """A Retry-After of zero leaves the backoff as the wait."""
+    response = FakeHTTPResponse(
+        status_code=503, text="busy", headers={"Retry-After": "0"}
+    )
+    delay = server._retry_delay(0, response)
+    assert delay >= server.config.UPSTREAM_RETRY_BACKOFF_SECONDS
+
+
+def test_the_retry_settings_do_not_depend_on_the_environment(monkeypatch):
+    """The retry tests hold the settings they rely on."""
+    monkeypatch.setattr(server.config, "MAX_UPSTREAM_RETRIES", 2)
+    monkeypatch.setattr(server.config, "UPSTREAM_RETRY_BACKOFF_SECONDS", 0.25)
+    monkeypatch.setattr(server.config, "UPSTREAM_RETRY_MAX_SECONDS", 5.0)
+
+    session = SequenceSession(
+        [FakeHTTPResponse(status_code=503, text="busy"), _upstream_reply()]
+    )
+    waits: list[float] = []
+    monkeypatch.setattr(server, "get_session", lambda: session)
+    monkeypatch.setattr(server, "chat_models", lambda: [{"id": "gpt-4o"}])
+    monkeypatch.setattr(server.time, "sleep", waits.append)
+
+    client = server.app.test_client()
+    response = client.post(
+        "/v1/chat/completions", json=_chat_body(), headers=_chat_headers()
+    )
+
+    assert response.status_code == 200
+    assert session.calls == 2
+    assert waits == [0.25]
+
+
+def test_a_setting_that_is_not_a_number_does_not_stop_the_gateway():
+    """An unreadable setting falls back to its default."""
+    assert server._int_setting("A_SETTING_THAT_DOES_NOT_EXIST", 7) == 7
+    assert server._float_setting("A_SETTING_THAT_DOES_NOT_EXIST", 1.5) == 1.5

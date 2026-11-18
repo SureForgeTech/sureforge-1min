@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- [FIX] A request the upstream declined with 429 or 503 is sent again, with a wait that grows with every attempt and follows the upstream's Retry-After header, whether it holds a number of seconds or a date; a file that can be rewound is sent again whole, and a request whose file cannot be rewound is not sent again, because it would upload nothing; a request that failed in the network is not sent again either, because the upstream may have handled it.
+- [FIX] A request the upstream declined with 429 or 503 is sent again, with a wait that grows with every attempt and follows the upstream's Retry-After header, whether it holds a number of seconds or a date, up to the longest wait the gateway allows; a file that can be rewound is sent again whole, and a request whose file cannot be rewound is not sent again, because it would upload nothing; a request that failed in the network is not sent again either, because the upstream may have handled it.
 - [INTERNAL] Pull requests are now welcome with a DCO sign-off (`git commit -s`): the organization contributing guide says so, and a new `dco` workflow checks the sign-off on pull requests from outside contributors.
 - [INTERNAL] The licence changes from MIT to Apache-2.0, with a NOTICE file. Releases published before this change keep the MIT licence they shipped with; only new releases carry Apache-2.0.
 - [INTERNAL] The copyright holder in `LICENSE` and the author in `pyproject.toml` are now SureForgeTech; the MIT licence text is unchanged.
