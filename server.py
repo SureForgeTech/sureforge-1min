@@ -226,7 +226,10 @@ def _retry_delay(attempt: int, response: requests.Response | None) -> float:
     Returns:
         float: The number of seconds to wait.
     """
-    backoff = config.UPSTREAM_RETRY_BACKOFF_SECONDS * (2.0**attempt)
+    backoff = min(
+        config.UPSTREAM_RETRY_BACKOFF_SECONDS * (2.0**attempt),
+        config.UPSTREAM_RETRY_MAX_SECONDS,
+    )
     if response is None:
         return backoff
     retry_after = response.headers.get("Retry-After")
@@ -264,7 +267,7 @@ def _file_stream(value: Any) -> Any:
     return None
 
 
-def _rewind_files(kwargs: dict[str, Any]) -> None:
+def _rewind_files(kwargs: dict[str, Any]) -> bool:
     """Move the streams of a multipart payload back to their beginning.
 
     The request library reads a file object while it builds the body, so a
@@ -273,6 +276,10 @@ def _rewind_files(kwargs: dict[str, Any]) -> None:
 
     Args:
         kwargs: The arguments of the request.
+
+    Returns:
+        bool: False when a file cannot be rewound, so that the request must
+        not be sent again.
     """
     files = kwargs.get("files")
     if isinstance(files, dict):
@@ -280,7 +287,7 @@ def _rewind_files(kwargs: dict[str, Any]) -> None:
     elif isinstance(files, (list, tuple)):
         values = list(files)
     else:
-        return
+        return True
     for value in values:
         stream = _file_stream(value)
         if stream is None:
@@ -288,12 +295,14 @@ def _rewind_files(kwargs: dict[str, Any]) -> None:
             continue
         seek = getattr(stream, "seek", None)
         if seek is None:
-            logger.warning("a file that is sent again cannot be rewound")
-            continue
+            logger.warning("a file that cannot be rewound is not sent again")
+            return False
         try:
             seek(0)
         except (OSError, ValueError):
             logger.warning("could not rewind a file that is sent again")
+            return False
+    return True
 
 
 def post_upstream(label: str, url: str, **kwargs: Any) -> requests.Response:
@@ -324,7 +333,11 @@ def post_upstream(label: str, url: str, **kwargs: Any) -> requests.Response:
             delay,
         )
         time.sleep(delay)
-        _rewind_files(kwargs)
+        if not _rewind_files(kwargs):
+            # The file cannot be sent again, so the decline is the answer
+            # rather than an upload with nothing in it.
+            logger.warning("the %s request is not sent again", label)
+            break
         try:
             sent_again = get_session().post(url, **kwargs)
         except requests.RequestException:

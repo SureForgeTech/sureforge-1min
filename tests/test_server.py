@@ -1142,22 +1142,31 @@ def test_a_file_that_is_sent_again_is_rewound_in_the_list_form(monkeypatch):
     assert all(body == payload for body in session.bodies)
 
 
-def test_a_file_that_cannot_be_rewound_is_skipped(monkeypatch):
-    """A file that has no seek is not sent empty because of the retry."""
+def test_a_file_that_cannot_be_rewound_is_not_sent_again(monkeypatch):
+    """A file that cannot be rewound is not sent again empty."""
 
     class NonSeekable:
         def __init__(self) -> None:
             self.data = b"payload"
+            self.read_done = False
 
         def read(self) -> bytes:
+            # The request library reads the file while it builds the body, so
+            # a second attempt would find it at its end.
+            if self.read_done:
+                return b""
+            self.read_done = True
             return self.data
 
     class Session:
         def __init__(self) -> None:
             self.calls = 0
+            self.bodies: list[bytes] = []
 
         def post(self, *args: Any, **kwargs: Any) -> FakeHTTPResponse:
             self.calls += 1
+            stream = server._file_stream(kwargs["files"]["asset"])
+            self.bodies.append(stream.read())
             return FakeHTTPResponse(status_code=503, text="busy")
 
     session = Session()
@@ -1171,7 +1180,9 @@ def test_a_file_that_cannot_be_rewound_is_skipped(monkeypatch):
     )
 
     assert response.status_code == 503
-    assert session.calls == server.config.MAX_UPSTREAM_RETRIES + 1
+    # The request was sent once: sending it again would upload nothing.
+    assert session.calls == 1
+    assert session.bodies == [b"payload"]
 
 
 def test_a_value_that_carries_no_file_is_not_reported(caplog):
@@ -1195,3 +1206,19 @@ def test_a_retry_setting_that_is_endless_is_bounded():
     assert config.MAX_UPSTREAM_RETRIES <= 10
     assert config.UPSTREAM_RETRY_BACKOFF_SECONDS <= 60.0
     assert config.UPSTREAM_RETRY_MAX_SECONDS <= 60.0
+
+
+def test_the_wait_stays_bounded_with_extreme_settings(monkeypatch):
+    """Even with the largest settings the caller is not held for hours."""
+    monkeypatch.setattr(server.config, "MAX_UPSTREAM_RETRIES", 10)
+    monkeypatch.setattr(server.config, "UPSTREAM_RETRY_BACKOFF_SECONDS", 60.0)
+    monkeypatch.setattr(server.config, "UPSTREAM_RETRY_MAX_SECONDS", 5.0)
+
+    class Response:
+        status_code = 503
+        headers: dict[str, str] = {}
+
+    waits = [server._retry_delay(attempt, Response()) for attempt in range(10)]
+
+    assert all(0 <= wait <= 5.0 for wait in waits)
+    assert sum(waits) <= 50.0
