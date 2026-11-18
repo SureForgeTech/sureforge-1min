@@ -1321,9 +1321,7 @@ def test_the_gateway_starts_with_a_setting_that_cannot_be_read():
             "MAX_UPSTREAM_RETRIES": "not-a-number",
             "UPSTREAM_RETRY_BACKOFF_SECONDS": "0.25s",
             "UPSTREAM_RETRY_MAX_SECONDS": "",
-            "PYTHONPATH": os.path.dirname(
-                os.path.dirname(os.path.abspath(server.__file__))
-            ),
+            "PYTHONPATH": os.path.dirname(os.path.abspath(server.__file__)),
         }
     )
     result = subprocess.run(
@@ -1368,8 +1366,9 @@ def test_a_file_whose_seek_cannot_be_called_is_not_sent_again(monkeypatch):
             calls.append(1)
             return FakeHTTPResponse(status_code=503, text="busy")
 
+    sleeps: list[float] = []
     monkeypatch.setattr(server, "get_session", lambda: Session())
-    monkeypatch.setattr(server.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(server.time, "sleep", sleeps.append)
 
     response = server.post_upstream(
         "asset",
@@ -1379,3 +1378,5 @@ def test_a_file_whose_seek_cannot_be_called_is_not_sent_again(monkeypatch):
 
     assert response.status_code == 503
     assert len(calls) == 1
+    # The caller was not held for a wait it would not use.
+    assert sleeps == []
