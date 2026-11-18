@@ -1,4 +1,5 @@
 import json
+from io import BytesIO
 from typing import Any, Generator
 import pytest
 import server
@@ -839,6 +840,7 @@ def test_a_request_the_upstream_declined_is_sent_again(monkeypatch):
         [FakeHTTPResponse(status_code=503, text="busy"), _upstream_reply()]
     )
     monkeypatch.setattr(server, "get_session", lambda: session)
+    monkeypatch.setattr(server, "chat_models", lambda: [{"id": "gpt-4o"}])
     monkeypatch.setattr(server.time, "sleep", lambda seconds: None)
 
     client = server.app.test_client()
@@ -862,6 +864,7 @@ def test_a_rate_limited_request_is_sent_again_after_the_retry_after(monkeypatch)
     )
     waits: list[float] = []
     monkeypatch.setattr(server, "get_session", lambda: session)
+    monkeypatch.setattr(server, "chat_models", lambda: [{"id": "gpt-4o"}])
     monkeypatch.setattr(server.time, "sleep", waits.append)
 
     client = server.app.test_client()
@@ -878,6 +881,7 @@ def test_a_rejected_request_is_not_sent_again(monkeypatch):
     """A request the upstream rejected is not sent again."""
     session = SequenceSession([FakeHTTPResponse(status_code=400, text="bad request")])
     monkeypatch.setattr(server, "get_session", lambda: session)
+    monkeypatch.setattr(server, "chat_models", lambda: [{"id": "gpt-4o"}])
     monkeypatch.setattr(server.time, "sleep", lambda seconds: None)
 
     client = server.app.test_client()
@@ -893,6 +897,7 @@ def test_a_request_the_upstream_keeps_declining_gives_up(monkeypatch):
     """The request is sent again a bounded number of times."""
     session = SequenceSession([FakeHTTPResponse(status_code=503, text="busy")])
     monkeypatch.setattr(server, "get_session", lambda: session)
+    monkeypatch.setattr(server, "chat_models", lambda: [{"id": "gpt-4o"}])
     monkeypatch.setattr(server.time, "sleep", lambda seconds: None)
 
     client = server.app.test_client()
@@ -901,13 +906,14 @@ def test_a_request_the_upstream_keeps_declining_gives_up(monkeypatch):
     )
 
     assert response.status_code == 503
-    assert session.calls == server.MAX_UPSTREAM_RETRIES + 1
+    assert session.calls == server.config.MAX_UPSTREAM_RETRIES + 1
 
 
 def test_a_request_that_failed_in_the_network_is_not_sent_again(monkeypatch):
     """A broken connection is not retried: the upstream may have handled it."""
     session = SequenceSession([server.requests.ConnectionError("connection reset")])
     monkeypatch.setattr(server, "get_session", lambda: session)
+    monkeypatch.setattr(server, "chat_models", lambda: [{"id": "gpt-4o"}])
     monkeypatch.setattr(server.time, "sleep", lambda seconds: None)
 
     client = server.app.test_client()
@@ -917,3 +923,109 @@ def test_a_request_that_failed_in_the_network_is_not_sent_again(monkeypatch):
 
     assert response.status_code == 500
     assert session.calls == 1
+
+
+def test_a_server_error_other_than_503_is_not_sent_again(monkeypatch):
+    """Only 429 and 503 mean the request was not handled."""
+    session = SequenceSession([FakeHTTPResponse(status_code=500, text="boom")])
+    monkeypatch.setattr(server, "get_session", lambda: session)
+    monkeypatch.setattr(server, "chat_models", lambda: [{"id": "gpt-4o"}])
+    monkeypatch.setattr(server.time, "sleep", lambda seconds: None)
+
+    client = server.app.test_client()
+    response = client.post(
+        "/v1/chat/completions", json=_chat_body(), headers=_chat_headers()
+    )
+
+    assert response.status_code == 500
+    assert session.calls == 1
+
+
+def test_the_wait_grows_with_every_attempt(monkeypatch):
+    """The wait before the next attempt grows."""
+    session = SequenceSession([FakeHTTPResponse(status_code=503, text="busy")])
+    waits: list[float] = []
+    monkeypatch.setattr(server, "get_session", lambda: session)
+    monkeypatch.setattr(server, "chat_models", lambda: [{"id": "gpt-4o"}])
+    monkeypatch.setattr(server.time, "sleep", waits.append)
+
+    client = server.app.test_client()
+    client.post("/v1/chat/completions", json=_chat_body(), headers=_chat_headers())
+
+    assert len(waits) == server.config.MAX_UPSTREAM_RETRIES
+    assert waits == sorted(waits)
+    assert waits[-1] > waits[0]
+
+
+def test_the_wait_is_capped(monkeypatch):
+    """A Retry-After header cannot make the wait longer than the cap."""
+    session = SequenceSession(
+        [
+            FakeHTTPResponse(
+                status_code=503, text="busy", headers={"Retry-After": "99999"}
+            )
+        ]
+    )
+    waits: list[float] = []
+    monkeypatch.setattr(server, "get_session", lambda: session)
+    monkeypatch.setattr(server, "chat_models", lambda: [{"id": "gpt-4o"}])
+    monkeypatch.setattr(server.time, "sleep", waits.append)
+
+    client = server.app.test_client()
+    client.post("/v1/chat/completions", json=_chat_body(), headers=_chat_headers())
+
+    assert waits
+    assert all(wait <= server.config.UPSTREAM_RETRY_MAX_SECONDS for wait in waits)
+
+
+def test_a_retry_after_that_cannot_be_read_does_not_break_the_request(monkeypatch):
+    """A Retry-After that is negative or not a number is ignored."""
+    for value in ("-1", "nan", "inf", "abc", "Wed, 21 Oct 2015 07:28:00 GMT"):
+        session = SequenceSession(
+            [
+                FakeHTTPResponse(
+                    status_code=503, text="busy", headers={"Retry-After": value}
+                ),
+                _upstream_reply(),
+            ]
+        )
+        monkeypatch.setattr(server, "get_session", lambda: session)
+        monkeypatch.setattr(server, "chat_models", lambda: [{"id": "gpt-4o"}])
+        monkeypatch.setattr(server.time, "sleep", lambda seconds: None)
+
+        client = server.app.test_client()
+        response = client.post(
+            "/v1/chat/completions", json=_chat_body(), headers=_chat_headers()
+        )
+        assert response.status_code == 200, value
+
+
+def test_a_file_that_is_sent_again_is_sent_whole(monkeypatch):
+    """A file that is sent again is not empty the second time."""
+
+    class UploadSession:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.bodies: list[bytes] = []
+
+        def post(self, *args: Any, **kwargs: Any) -> FakeHTTPResponse:
+            self.calls += 1
+            stream = kwargs["files"]["asset"][1]
+            self.bodies.append(stream.read())
+            return FakeHTTPResponse(status_code=503, text="busy")
+
+    session = UploadSession()
+    monkeypatch.setattr(server, "get_session", lambda: session)
+    monkeypatch.setattr(server.time, "sleep", lambda seconds: None)
+
+    payload = b"\x89PNG\r\n\x1a\n" + b"x" * 32
+    stream = BytesIO(payload)
+    server.post_upstream(
+        "asset",
+        "https://example.invalid/assets",
+        files={"asset": ("a.png", stream, "image/png")},
+    )
+
+    assert session.calls == server.config.MAX_UPSTREAM_RETRIES + 1
+    assert session.bodies[0] == payload
+    assert all(body == payload for body in session.bodies)

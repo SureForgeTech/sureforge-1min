@@ -4,8 +4,11 @@ import atexit
 import base64
 import binascii
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import json
 import logging
+import math
 import os
 import socket
 import re
@@ -62,6 +65,13 @@ class GatewayConfig:
         "yes",
     )
     CATALOG_TTL_SECONDS: int = int(os.getenv("CATALOG_TTL_SECONDS", "300"))
+    MAX_UPSTREAM_RETRIES: int = int(os.getenv("MAX_UPSTREAM_RETRIES", "2"))
+    UPSTREAM_RETRY_BACKOFF_SECONDS: float = float(
+        os.getenv("UPSTREAM_RETRY_BACKOFF_SECONDS", "0.25")
+    )
+    UPSTREAM_RETRY_MAX_SECONDS: float = float(
+        os.getenv("UPSTREAM_RETRY_MAX_SECONDS", "5")
+    )
     MAX_IMAGE_BYTES: int = int(os.getenv("MAX_IMAGE_BYTES", str(10 * 1024 * 1024)))
     CORS_ALLOW_ORIGIN: str = os.getenv("CORS_ALLOW_ORIGIN", "*")
     PORT: int = 5001
@@ -164,16 +174,39 @@ def close_session() -> None:
 # again. A timeout or a broken connection is not in this list: the upstream may
 # have handled the request, and sending it again could bill the caller twice.
 RETRY_STATUS_CODES = {429, 503}
-# How many times a request that was declined is sent again.
-MAX_UPSTREAM_RETRIES = 2
-# The wait before the first retry; it doubles with every attempt.
-RETRY_BACKOFF_SECONDS = 0.25
-# The longest wait a Retry-After header may ask for.
-MAX_RETRY_AFTER_SECONDS = 5.0
+
+
+def _retry_after_seconds(value: str) -> float | None:
+    """Read a Retry-After header, which holds a number of seconds or a date.
+
+    Args:
+        value: The header value.
+
+    Returns:
+        float | None: The number of seconds the header asks for, or None when
+        the value cannot be read.
+    """
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return (when - datetime.now(timezone.utc)).total_seconds()
 
 
 def _retry_delay(attempt: int, response: requests.Response | None) -> float:
     """Return how long to wait before the next attempt.
+
+    The wait grows with every attempt. A Retry-After header of the upstream is
+    followed, but never shortens the wait and never makes it longer than
+    ``UPSTREAM_RETRY_MAX_SECONDS``.
 
     Args:
         attempt: The number of the attempt that just failed, from zero.
@@ -182,14 +215,43 @@ def _retry_delay(attempt: int, response: requests.Response | None) -> float:
     Returns:
         float: The number of seconds to wait.
     """
-    if response is not None:
-        retry_after = response.headers.get("Retry-After")
-        if retry_after:
-            try:
-                return min(float(retry_after), MAX_RETRY_AFTER_SECONDS)
-            except ValueError:
-                logger.warning("upstream sent an unreadable Retry-After header")
-    return RETRY_BACKOFF_SECONDS * (2.0**attempt)
+    backoff = config.UPSTREAM_RETRY_BACKOFF_SECONDS * (2.0**attempt)
+    if response is None:
+        return backoff
+    retry_after = response.headers.get("Retry-After")
+    if not retry_after:
+        return backoff
+    seconds = _retry_after_seconds(retry_after)
+    if seconds is None:
+        logger.warning("upstream sent an unreadable Retry-After header")
+        return backoff
+    if not math.isfinite(seconds):
+        seconds = config.UPSTREAM_RETRY_MAX_SECONDS
+    return min(max(seconds, backoff), config.UPSTREAM_RETRY_MAX_SECONDS)
+
+
+def _rewind_files(kwargs: dict[str, Any]) -> None:
+    """Move the streams of a multipart payload back to their beginning.
+
+    The request library reads a file object while it builds the body, so a
+    payload that is sent again has to start over. Without this the second
+    attempt would upload an empty file.
+
+    Args:
+        kwargs: The arguments of the request.
+    """
+    files = kwargs.get("files")
+    if not isinstance(files, dict):
+        return
+    for value in files.values():
+        stream = value[1] if isinstance(value, tuple) and len(value) > 1 else value
+        seek = getattr(stream, "seek", None)
+        if seek is None:
+            continue
+        try:
+            seek(0)
+        except (OSError, ValueError):
+            logger.warning("could not rewind a file that is sent again")
 
 
 def post_upstream(label: str, url: str, **kwargs: Any) -> requests.Response:
@@ -207,8 +269,9 @@ def post_upstream(label: str, url: str, **kwargs: Any) -> requests.Response:
     Returns:
         requests.Response: The response of the last attempt.
     """
+    _rewind_files(kwargs)
     response = get_session().post(url, **kwargs)
-    for attempt in range(MAX_UPSTREAM_RETRIES):
+    for attempt in range(config.MAX_UPSTREAM_RETRIES):
         if response.status_code not in RETRY_STATUS_CODES:
             break
         delay = _retry_delay(attempt, response)
@@ -219,7 +282,16 @@ def post_upstream(label: str, url: str, **kwargs: Any) -> requests.Response:
             delay,
         )
         time.sleep(delay)
-        response = get_session().post(url, **kwargs)
+        _rewind_files(kwargs)
+        try:
+            sent_again = get_session().post(url, **kwargs)
+        except requests.RequestException:
+            # The upstream may have handled the request, so the decline is a
+            # better answer than a broken connection.
+            logger.warning("the %s request failed while it was sent again", label)
+            break
+        response.close()
+        response = sent_again
     return response
 
 
