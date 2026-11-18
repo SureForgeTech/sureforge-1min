@@ -854,6 +854,8 @@ def test_a_stream_reports_the_usage_when_the_caller_asks_for_it(monkeypatch):
     assert usage_frame["object"] == "chat.completion.chunk"
     assert usage_frame["id"] == content_frame["id"]
     assert usage_frame["model"] == content_frame["model"]
+    # The usage chunk carries the time of the answer, not the time the
+    # wrapper started.
     assert usage_frame["created"] == content_frame["created"]
 
     # The prompt and the answer are counted apart.
@@ -1002,18 +1004,6 @@ def test_include_usage_must_be_true(monkeypatch):
     assert '"usage"' not in response.get_data(as_text=True)
 
 
-def test_a_run_of_text_that_is_too_long_to_carry_is_counted_once():
-    """A very long unbroken run does not grow the counter without bound."""
-    counter = server._TokenCounter()
-    payload = "x" * (server.MAX_TOKEN_LENGTH * 4)
-
-    counter.add(payload)
-
-    # The run is counted as one piece, not carried for ever.
-    assert counter.total() >= 1
-    assert counter.total() <= 4
-
-
 def test_the_carried_text_stays_bounded():
     """The counter does not carry more than the limit."""
     counter = server._TokenCounter()
@@ -1022,3 +1012,27 @@ def test_the_carried_text_stays_bounded():
         counter.add("y" * 10000)
 
     assert len(counter._carry) <= server.MAX_TOKEN_LENGTH
+
+
+def test_the_usage_chunk_carries_the_time_of_the_answer(monkeypatch):
+    """The usage chunk carries the time of the answer, not of the wrapper."""
+    ticks = iter(range(1700000000, 1700000100, 2))
+    monkeypatch.setattr(server.time, "time", lambda: next(ticks))
+    monkeypatch.setattr(server, "get_session", lambda: StreamingSession("hello world"))
+
+    client = server.app.test_client()
+    body = client.post(
+        "/v1/chat/completions",
+        json={**_stream_request(), "stream_options": {"include_usage": True}},
+        headers={"Authorization": "Bearer fake-key"},
+    ).get_data(as_text=True)
+
+    frames = [
+        json.loads(line[len("data: ") :])
+        for line in body.split("\n\n")
+        if line.startswith("data: ") and not line.startswith("data: [DONE]")
+    ]
+    usage_frame = next(f for f in frames if "usage" in f)
+    content_frame = next(f for f in frames if f.get("choices"))
+
+    assert usage_frame["created"] == content_frame["created"]

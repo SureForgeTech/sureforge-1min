@@ -1299,7 +1299,7 @@ def stream_with_usage(
                 stream_id = chunk_id
             if chunk_model:
                 model = chunk_model
-            if chunk_created:
+            if chunk_created and not created:
                 created = chunk_created
             if chunk.startswith("data: [DONE]"):
                 completion_tokens = counter.total()
