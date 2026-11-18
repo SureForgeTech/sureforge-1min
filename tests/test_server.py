@@ -858,7 +858,6 @@ def test_a_stream_reports_the_usage_when_the_caller_asks_for_it(monkeypatch):
     # wrapper started.
     assert usage_frame["created"] == content_frame["created"]
 
-    # The prompt and the answer are counted apart.
     # The prompt and the answer are counted apart: the answer is the text the
     # gateway sent.
     usage = usage_frame["usage"]
