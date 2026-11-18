@@ -974,3 +974,161 @@ def test_a_far_too_large_image_is_refused_without_being_decoded(monkeypatch):
 
     assert isinstance(result, tuple)
     assert result[1] == 413
+
+
+def test_the_body_is_read_with_a_limit_of_its_own(monkeypatch):
+    """The body is read with a limit, so it cannot be read whole into memory."""
+    monkeypatch.setattr(server.config, "MAX_REQUEST_BYTES", 1024)
+
+    class Stream:
+        """A request body that records how much was asked for."""
+
+        def __init__(self) -> None:
+            self.data = b"x" * 4096
+            self.position = 0
+            self.requested: list[int] = []
+
+        def read(self, size: int = -1) -> bytes:
+            self.requested.append(size)
+            if size is None or size < 0:
+                size = len(self.data) - self.position
+            chunk = self.data[self.position : self.position + size]
+            self.position += len(chunk)
+            return chunk
+
+    stream = Stream()
+    environ = {
+        "REQUEST_METHOD": "POST",
+        "PATH_INFO": "/v1/chat/completions",
+        "CONTENT_TYPE": "application/json",
+        "HTTP_AUTHORIZATION": "Bearer fake-key",
+        "wsgi.input": stream,
+        "wsgi.url_scheme": "http",
+        "SERVER_NAME": "localhost",
+        "SERVER_PORT": "80",
+        "wsgi.errors": io.StringIO(),
+        "wsgi.version": (1, 0),
+        "wsgi.multithread": False,
+        "wsgi.multiprocess": False,
+        "wsgi.run_once": False,
+    }
+    captured: dict[str, str] = {}
+
+    def start_response(status: str, headers: Any, exc_info: Any = None) -> Any:
+        captured["status"] = status
+        return lambda data: None
+
+    b"".join(server.create_app()(environ, start_response))
+
+    # The body was asked for with the limit and nothing more.
+    assert stream.requested
+    assert max(stream.requested) <= 1025
+    assert max(stream.requested) > 0
+
+
+def test_a_declared_body_over_the_limit_is_refused_without_reading_it(monkeypatch):
+    """A body that declares a length over the limit is refused unread."""
+    monkeypatch.setattr(server.config, "MAX_REQUEST_BYTES", 1024)
+
+    class Stream:
+        def __init__(self) -> None:
+            self.reads = 0
+
+        def read(self, size: int = -1) -> bytes:
+            self.reads += 1
+            return b"x" * 4096
+
+    stream = Stream()
+    environ = {
+        "REQUEST_METHOD": "POST",
+        "PATH_INFO": "/v1/chat/completions",
+        "CONTENT_TYPE": "application/json",
+        "CONTENT_LENGTH": "4096",
+        "HTTP_AUTHORIZATION": "Bearer fake-key",
+        "wsgi.input": stream,
+        "wsgi.url_scheme": "http",
+        "SERVER_NAME": "localhost",
+        "SERVER_PORT": "80",
+        "wsgi.errors": io.StringIO(),
+        "wsgi.version": (1, 0),
+        "wsgi.multithread": False,
+        "wsgi.multiprocess": False,
+        "wsgi.run_once": False,
+    }
+    captured: dict[str, str] = {}
+
+    def start_response(status: str, headers: Any, exc_info: Any = None) -> Any:
+        captured["status"] = status
+        return lambda data: None
+
+    body = b"".join(server.create_app()(environ, start_response))
+
+    assert "413" in captured["status"]
+    assert b"request_too_large" in body
+    # The body was never read.
+    assert stream.reads == 0
+
+
+def test_a_body_of_exactly_the_limit_is_accepted(monkeypatch):
+    """A body of exactly the limit is not over the limit."""
+    monkeypatch.setattr(server.config, "MAX_REQUEST_BYTES", 1024)
+
+    class FakeSession:
+        def get(self, *args: Any, **kwargs: Any) -> FakeHTTPResponse:
+            return FakeHTTPResponse(text=json.dumps({"models": [{"id": "gpt-4o"}]}))
+
+        def post(self, *args: Any, **kwargs: Any) -> FakeHTTPResponse:
+            return FakeHTTPResponse(
+                text=json.dumps(
+                    {"aiRecord": {"aiRecordDetail": {"resultObject": "hi"}}}
+                )
+            )
+
+    monkeypatch.setattr(server, "get_session", lambda: FakeSession())
+    # A body of exactly the limit is not over the limit.
+    template = json.dumps(
+        {"model": "gpt-4o", "messages": [{"role": "user", "content": ""}]}
+    )
+    filler = "x" * (1024 - len(template))
+    payload = json.dumps(
+        {"model": "gpt-4o", "messages": [{"role": "user", "content": filler}]}
+    ).encode("utf-8")
+    assert len(payload) == 1024
+
+    class Stream:
+        def __init__(self) -> None:
+            self.data = payload
+            self.position = 0
+
+        def read(self, size: int = -1) -> bytes:
+            if size is None or size < 0:
+                size = len(self.data) - self.position
+            chunk = self.data[self.position : self.position + size]
+            self.position += len(chunk)
+            return chunk
+
+    environ = {
+        "REQUEST_METHOD": "POST",
+        "PATH_INFO": "/v1/chat/completions",
+        "CONTENT_TYPE": "application/json",
+        "CONTENT_LENGTH": str(len(payload)),
+        "HTTP_AUTHORIZATION": "Bearer fake-key",
+        "wsgi.input": Stream(),
+        "wsgi.url_scheme": "http",
+        "SERVER_NAME": "localhost",
+        "SERVER_PORT": "80",
+        "wsgi.errors": io.StringIO(),
+        "wsgi.version": (1, 0),
+        "wsgi.multithread": False,
+        "wsgi.multiprocess": False,
+        "wsgi.run_once": False,
+    }
+    captured: dict[str, str] = {}
+
+    def start_response(status: str, headers: Any, exc_info: Any = None) -> Any:
+        captured["status"] = status
+        return lambda data: None
+
+    b"".join(server.create_app()(environ, start_response))
+
+    assert "200" in captured["status"]

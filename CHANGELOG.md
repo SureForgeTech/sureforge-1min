@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- [SECURITY] Request bodies are bounded: a body larger than `MAX_REQUEST_BYTES` (16 MB by default) is refused with `413` before it is read, instead of being held in memory, and an inline base64 image over the image limit is refused; a payload far over the limit is refused before it is decoded at all.
+- [SECURITY] Request bodies are bounded: a body larger than `MAX_REQUEST_BYTES` (16 MB by default) is refused with `413` before it is read, instead of being held in memory, and an inline base64 image over the image limit is refused; a payload far over the limit is refused before it is decoded at all. A body over the limit by more than a megabyte is refused by the server in front, with a plain-text `413`.
 - [INTERNAL] Pull requests are now welcome with a DCO sign-off (`git commit -s`): the organization contributing guide says so, and a new `dco` workflow checks the sign-off on pull requests from outside contributors.
 - [INTERNAL] The licence changes from MIT to Apache-2.0, with a NOTICE file. Releases published before this change keep the MIT licence they shipped with; only new releases carry Apache-2.0.
 - [INTERNAL] The copyright holder in `LICENSE` and the author in `pyproject.toml` are now SureForgeTech; the MIT licence text is unchanged.

@@ -1113,8 +1113,8 @@ def decode_data_image(image_url: str) -> BytesIO | tuple[Response, int]:
         return error_response("Invalid image data URL.", 400, "invalid_image")
     # The encoded text is measured before it is decoded, so a payload that is
     # far over the limit is never turned into bytes in memory. The bound is
-    # the longest text a payload within the limit can have, because a payload
-    # of one byte more can have the same text length.
+    # the longest text a payload of the limit can have, plus one quantum,
+    # because a payload of one byte more can have the same text length.
     if len(encoded) > 4 * ((config.MAX_IMAGE_BYTES + 4) // 3):
         return error_response("Image payload is too large.", 413, "image_too_large")
     try:
@@ -1701,8 +1701,9 @@ def create_app() -> Flask:
     """
     app = Flask(__name__)
     app.url_map.strict_slashes = False
-    # Reject a body that is larger than the gateway accepts, instead of
-    # reading it into memory.
+    # A backstop for anything that reads the body through the framework. The
+    # application reads the raw input with a limit of its own, so that a body
+    # which declares no length is refused as well.
     app.config["MAX_CONTENT_LENGTH"] = config.MAX_REQUEST_BYTES
 
     # 11. Relocate global logging initialization inside create_app
