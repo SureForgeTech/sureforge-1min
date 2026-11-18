@@ -1343,6 +1343,8 @@ def _chunk_parts(chunk: str) -> tuple[str, str, str]:
         body = json.loads(chunk[len("data: ") :].strip())
     except json.JSONDecodeError:
         return "", "", ""
+    if not isinstance(body, dict):
+        return "", "", ""
     text = ""
     choices = body.get("choices")
     if isinstance(choices, list):
@@ -1351,7 +1353,7 @@ def _chunk_parts(chunk: str) -> tuple[str, str, str]:
                 continue
             delta = choice.get("delta")
             if isinstance(delta, dict):
-                text += delta.get("content") or ""
+                text += str(delta.get("content") or "")
     return text, str(body.get("id") or ""), str(body.get("model") or "")
 
 
