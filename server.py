@@ -1282,31 +1282,38 @@ def stream_with_usage(
     """
     counter = _TokenCounter()
     stream_id = f"chatcmpl-{uuid.uuid4()}"
-    for chunk in chunks:
-        if chunk == "data: [DONE]\n\n":
-            yield (
-                "data: "
-                + json.dumps(
-                    {
-                        "id": stream_id,
-                        "object": "chat.completion.chunk",
-                        "created": int(time.time()),
-                        "model": "",
-                        "choices": [],
-                        "usage": {
-                            "prompt_tokens": prompt_tokens,
-                            "completion_tokens": counter.total(),
-                            "total_tokens": prompt_tokens + counter.total(),
+    try:
+        for chunk in chunks:
+            if chunk == "data: [DONE]\n\n":
+                yield (
+                    "data: "
+                    + json.dumps(
+                        {
+                            "id": stream_id,
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": "",
+                            "choices": [],
+                            "usage": {
+                                "prompt_tokens": prompt_tokens,
+                                "completion_tokens": counter.total(),
+                                "total_tokens": prompt_tokens + counter.total(),
+                            },
                         },
-                    },
-                    ensure_ascii=False,
+                        ensure_ascii=False,
+                    )
+                    + "\n\n"
                 )
-                + "\n\n"
-            )
+                yield chunk
+                continue
+            counter.add(_chunk_content(chunk))
             yield chunk
-            continue
-        counter.add(_chunk_content(chunk))
-        yield chunk
+    finally:
+        # The chunks are closed with the wrapper, so that the upstream response
+        # is released when the caller stops reading.
+        close = getattr(chunks, "close", None)
+        if close is not None:
+            close()
 
 
 def _chunk_content(chunk: str) -> str:

@@ -881,3 +881,50 @@ def test_the_token_count_does_not_depend_on_where_the_text_was_split():
     split.add("hello wo")
     split.add("rld")
     assert whole.total() == split.total()
+
+
+def test_the_usage_wrapper_closes_the_chunks_it_wraps():
+    """The chunks are closed with the wrapper, so the upstream is released."""
+    closed = []
+
+    class ClosingChunks:
+        def __init__(self) -> None:
+            self.done = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.done:
+                raise StopIteration
+            self.done = True
+            return "data: [DONE]\n\n"
+
+        def close(self):
+            closed.append(True)
+
+    stream = server.stream_with_usage(ClosingChunks(), 3)
+    events = list(stream)
+    assert events[-1] == "data: [DONE]\n\n"
+    assert '"usage"' in events[0]
+    assert closed == [True]
+
+
+def test_the_usage_wrapper_closes_the_chunks_when_it_is_stopped():
+    """The chunks are closed when the caller stops reading."""
+    closed = []
+
+    class ClosingChunks:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return "data: {}\n\n"
+
+        def close(self):
+            closed.append(True)
+
+    stream = server.stream_with_usage(ClosingChunks(), 3)
+    next(stream)
+    stream.close()
+    assert closed == [True]
