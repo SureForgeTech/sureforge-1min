@@ -211,6 +211,12 @@ def test_non_stream_chat_translates_tool_call(monkeypatch):
 
 def test_stream_response_returns_tool_call_chunks(monkeypatch):
     class FakeResponse:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
         def iter_lines(self, decode_unicode=False):
             return [
                 b"event: content",
@@ -304,6 +310,12 @@ def test_stream_response_large_tool_call_no_truncation():
     long_tool_call_text = f'<tool_call>{{"name":"glob","arguments":{{"pattern":"{long_argument_value}"}}}}</tool_call>'
 
     class FakeResponse:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
         def iter_lines(self, decode_unicode=False):
             return [
                 b"event: content",
@@ -802,3 +814,305 @@ def test_urllib3_major_version_matches_declared_dependency():
 
     assert int(urllib3.__version__.split(".")[0]) >= 2
     assert server.NameResolutionError is urllib3.exceptions.NameResolutionError
+
+
+def _streamed_content(chunks):
+    """Collect the content deltas a stream_response() generator emitted."""
+    out = []
+    for chunk in chunks:
+        if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
+            body = json.loads(chunk[len("data: ") :].strip())
+            out.append(body["choices"][0].get("delta", {}).get("content") or "")
+    return "".join(out)
+
+
+def _delta_stream(text, size):
+    """Split text into upstream SSE deltas of `size` characters."""
+    return [
+        f"data: {json.dumps({'delta': {'content': text[i : i + size]}})}".encode(
+            "utf-8"
+        )
+        for i in range(0, len(text), size)
+    ]
+
+
+def test_stream_response_preserves_whitespace_across_flush_boundary():
+    """Streamed content must reach the client byte for byte, spaces and newlines included."""
+    text = "The quick brown fox jumps over the lazy dog. " * 12
+    text += "a paragraph\nwith two lines\nand a trailing newline\n"
+
+    class FakeResponse:
+        def iter_lines(self, decode_unicode=False):
+            return _delta_stream(text, 120)
+
+        def close(self):
+            pass
+
+    received = _streamed_content(server.stream_response(FakeResponse(), {}, "m"))
+    assert received == text
+
+
+def test_stream_response_drops_crawl_line_split_across_deltas():
+    """A crawl-status line split across deltas is dropped whole, not leaked."""
+    crawl = "\U0001f310 Crawling site https://example.com\n"
+    body = "F" * 180 + "after\n"
+
+    class FakeResponse:
+        def iter_lines(self, decode_unicode=False):
+            return [
+                b"data: "
+                + json.dumps({"delta": {"content": crawl[:29]}}).encode("utf-8"),
+                b"data: "
+                + json.dumps({"delta": {"content": crawl[29:]}}).encode("utf-8"),
+                b"data: " + json.dumps({"delta": {"content": body}}).encode("utf-8"),
+            ]
+
+        def close(self):
+            pass
+
+    received = _streamed_content(server.stream_response(FakeResponse(), {}, "m"))
+    assert received == body
+    assert "Crawling" not in received
+    assert "example.com" not in received
+
+
+def test_stream_response_preserves_trailing_newline():
+    """The final tail is not stripped of its trailing newline."""
+
+    class FakeResponse:
+        def iter_lines(self, decode_unicode=False):
+            return [
+                b"data: " + json.dumps({"delta": {"content": "done\n"}}).encode("utf-8")
+            ]
+
+        def close(self):
+            pass
+
+    received = _streamed_content(server.stream_response(FakeResponse(), {}, "m"))
+    assert received == "done\n"
+
+
+def test_stream_response_closes_upstream_on_tool_call_exit():
+    """The upstream response is closed when the tool-call path returns early."""
+
+    class FakeResponse:
+        def __init__(self):
+            self.closed = False
+
+        def iter_lines(self, decode_unicode=False):
+            return [
+                b"event: content",
+                b'data: {"delta":{"content":"<tool_call>{\\"name\\":\\"glob\\",\\"arguments\\":{\\"pattern\\":\\"*\\"}}</tool_call>"}}',
+                b"",
+                b"data: [DONE]",
+            ]
+
+        def close(self):
+            self.closed = True
+
+    upstream = FakeResponse()
+    stream = server.stream_response(
+        upstream, {"tools": [{"function": {"name": "glob"}}]}, "m"
+    )
+    events = []
+    for event in stream:
+        events.append(event)
+        if event == "data: [DONE]\n\n":
+            # The gateway stops reading the upstream at the tool call, so the
+            # response is released before the done marker is sent.
+            assert upstream.closed is True
+            break
+    assert any("tool_calls" in event for event in events)
+
+
+def test_stream_response_closes_upstream_before_the_first_chunk():
+    """The upstream response is closed even when the stream is closed unread."""
+
+    class FakeResponse:
+        def __init__(self):
+            self.closed = False
+
+        def iter_lines(self, decode_unicode=False):
+            yield b'data: {"delta":{"content":"never read"}}'
+
+        def close(self):
+            self.closed = True
+
+    upstream = FakeResponse()
+    stream = server.stream_response(upstream, {}, "m")
+    stream.close()
+    assert upstream.closed is True
+
+
+def test_stream_response_keeps_content_when_crawl_marker_is_mid_line():
+    """A crawl marker in the middle of a line is ordinary text, not a status line."""
+    marker = "\U0001f310 Crawling site "
+    text = "A" * 100 + marker + "https://example.com/" + "B" * 400
+
+    class FakeResponse:
+        def iter_lines(self, decode_unicode=False):
+            return [
+                f"data: {json.dumps({'delta': {'content': text[i : i + 4]}})}".encode(
+                    "utf-8"
+                )
+                for i in range(0, len(text), 4)
+            ]
+
+        def close(self):
+            pass
+
+    received = _streamed_content(server.stream_response(FakeResponse(), {}, "m"))
+    assert received == text
+
+
+def test_stream_response_keeps_a_tool_call_on_a_crawl_status_line():
+    """A tool call is delivered even when it shares a line with a status line."""
+    text = (
+        "\U0001f310 Crawling site https://x"
+        '<tool_call>{"name":"glob","arguments":{"pattern":"*"}}</tool_call>'
+    )
+
+    class FakeResponse:
+        def iter_lines(self, decode_unicode=False):
+            return [
+                f"data: {json.dumps({'delta': {'content': text[i : i + 1]}})}".encode(
+                    "utf-8"
+                )
+                for i in range(0, len(text))
+            ]
+
+        def close(self):
+            pass
+
+    chunks = list(
+        server.stream_response(
+            FakeResponse(), {"tools": [{"function": {"name": "glob"}}]}, "m"
+        )
+    )
+    assert any("tool_calls" in chunk for chunk in chunks)
+    # The crawl-status text is still not sent to the client.
+    assert not any("Crawling" in chunk for chunk in chunks)
+
+
+def test_stream_response_streams_a_long_line_incrementally():
+    """A long line without a newline is streamed instead of buffered whole."""
+    chunk = " " * 50
+    total = 400
+
+    class FakeResponse:
+        def iter_lines(self, decode_unicode=False):
+            return [
+                f"data: {json.dumps({'delta': {'content': chunk}})}".encode("utf-8")
+                for _ in range(total)
+            ]
+
+        def close(self):
+            pass
+
+    parts = []
+    for event in server.stream_response(FakeResponse(), {}, "m"):
+        if event.startswith("data: ") and not event.startswith("data: [DONE]"):
+            body = json.loads(event[len("data: ") :].strip())
+            content = body["choices"][0].get("delta", {}).get("content") or ""
+            if content:
+                parts.append(content)
+    assert len(parts) > 1
+    assert "".join(parts) == chunk * total
+
+
+def test_stream_response_closes_upstream_when_consumer_stops():
+    """The upstream response is closed when the client disconnects mid-stream."""
+
+    class FakeResponse:
+        def __init__(self):
+            self.closed = False
+
+        def iter_lines(self, decode_unicode=False):
+            yield b'data: {"delta":{"content":"partial"}}'
+
+        def close(self):
+            self.closed = True
+
+    upstream = FakeResponse()
+    stream = server.stream_response(upstream, {}, "m")
+    next(stream)
+    stream.close()
+    assert upstream.closed is True
+
+
+def test_a_crawl_status_line_in_an_unfinished_tool_call_is_dropped():
+    """A tool call that never ends does not let a status line through."""
+    text = "<tool_call\nbefore\n\U0001f310 Crawling site https://x\nafter\n"
+
+    class FakeResponse:
+        def iter_lines(self, decode_unicode=False):
+            return [f"data: {json.dumps({'delta': {'content': text}})}".encode("utf-8")]
+
+        def close(self):
+            pass
+
+    received = _streamed_content(server.stream_response(FakeResponse(), {}, "m"))
+
+    assert "Crawling" not in received
+    assert "before" in received
+    assert "after" in received
+
+
+def test_a_long_crawl_status_line_is_dropped_whole():
+    """A crawl-status line that is longer than a short one is still dropped."""
+    line = "\U0001f310 Crawling site " + " " * 5000 + "https://x\n"
+
+    class FakeResponse:
+        def iter_lines(self, decode_unicode=False):
+            return [
+                f"data: {json.dumps({'delta': {'content': line[i : i + 200]}})}".encode(
+                    "utf-8"
+                )
+                for i in range(0, len(line), 200)
+            ]
+
+        def close(self):
+            pass
+
+    received = _streamed_content(server.stream_response(FakeResponse(), {}, "m"))
+
+    assert "Crawling" not in received
+    assert "uuuu" not in received
+
+
+def test_a_crawl_status_line_after_a_long_run_of_spaces_is_dropped():
+    """A status line that follows a long run of spaces is still dropped."""
+    line = " " * 4100 + "\U0001f310 Crawling site hidden\n"
+
+    class FakeResponse:
+        def iter_lines(self, decode_unicode=False):
+            return [
+                f"data: {json.dumps({'delta': {'content': line[i : i + 137]}})}".encode(
+                    "utf-8"
+                )
+                for i in range(0, len(line), 137)
+            ]
+
+        def close(self):
+            pass
+
+    received = _streamed_content(server.stream_response(FakeResponse(), {}, "m"))
+
+    assert "Crawling" not in received
+    assert "hidden" not in received
+
+
+def test_a_crawl_status_line_at_the_end_without_a_newline_is_dropped():
+    """A crawl-status line that ends the answer without a newline is dropped."""
+    text = "<tool_call\n\U0001f310 Crawling site https://x"
+
+    class FakeResponse:
+        def iter_lines(self, decode_unicode=False):
+            return [f"data: {json.dumps({'delta': {'content': text}})}".encode("utf-8")]
+
+        def close(self):
+            pass
+
+    received = _streamed_content(server.stream_response(FakeResponse(), {}, "m"))
+
+    assert received == "<tool_call\n"

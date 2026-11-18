@@ -619,8 +619,22 @@ def parse_tool_text(text: str, tools: list[dict[str, Any]]) -> dict[str, Any] | 
     return None
 
 
+CRAWL_MARKER = "🌐 Crawling site "
+
+# The most text held back, in characters, while it is still undecided whether
+# the current line is a crawl-status line. The holdback is what lets the
+# filter see the marker after any leading space, so it is generous; a line
+# that is still undecided when it is longer than this is let through rather
+# than held.
+CRAWL_HOLDBACK_MAX = 8192
+
+
 def clean_text(text: str) -> str:
     """Clean specific crawl status lines from output text.
+
+    This is the whole-text path, used where the complete response is
+    available. The streaming path filters at line boundaries instead and
+    keeps the text byte for byte.
 
     Args:
         text: The text to clean.
@@ -629,11 +643,103 @@ def clean_text(text: str) -> str:
         str: Cleaned text content.
     """
     lines = [
-        line
-        for line in text.splitlines()
-        if not line.strip().startswith("🌐 Crawling site ")
+        line for line in text.splitlines() if not line.strip().startswith(CRAWL_MARKER)
     ]
     return "\n".join(lines).strip()
+
+
+def _is_crawl_line(text: str) -> bool:
+    """Return True when a line is a crawl-status line that must be dropped.
+
+    Args:
+        text: One line, without its terminator.
+
+    Returns:
+        bool: True if the line must not reach the client.
+    """
+    return text.strip().startswith(CRAWL_MARKER)
+
+
+def _crawl_decision(text: str) -> str:
+    """Classify a line that is still being received.
+
+    A line is a crawl-status line when its first non-space characters are the
+    crawl marker. While the text seen so far still matches that marker, more
+    text could turn it into a crawl-status line, so the answer stays
+    undecided and the line is held back.
+
+    Args:
+        text: The part of the line received so far.
+
+    Returns:
+        str: "crawl" when the line is a crawl-status line, "clear" when it
+        cannot be one, and "undecided" while more text could change that.
+    """
+    stripped = text.lstrip()
+    if not stripped:
+        return "undecided"
+    if stripped.startswith(CRAWL_MARKER):
+        # The marker is there. It counts only when non-space text follows it,
+        # because the marker on its own is not a crawl-status line.
+        return "crawl" if stripped[len(CRAWL_MARKER) :].strip() else "undecided"
+    if CRAWL_MARKER.startswith(stripped):
+        return "undecided"
+    return "clear"
+
+
+def _drop_crawl_lines(text: str, at_line_start: bool) -> str:
+    """Drop the crawl-status lines among the complete lines of a text.
+
+    The text may hold more than one line, which happens when a tool call was
+    never finished and the line splitting was skipped. The first line is only
+    a crawl-status line when it really begins a line.
+
+    Args:
+        text: Text that holds complete lines and a trailing partial line.
+        at_line_start: Whether the first line of the text begins a line.
+
+    Returns:
+        str: The text without its crawl-status lines.
+    """
+    if "\n" not in text:
+        if at_line_start and _is_crawl_line(text):
+            return ""
+        return text
+    head, _, partial = text.rpartition("\n")
+    kept: list[str] = []
+    for index, line in enumerate(head.split("\n")):
+        if _is_crawl_line(line) and (at_line_start or index > 0):
+            continue
+        kept.append(line)
+    result = "\n".join(kept)
+    if kept:
+        result += "\n"
+    # The last line has no terminator, but it still begins a line, so a
+    # crawl-status line among them is dropped as well.
+    if partial and not _is_crawl_line(partial):
+        result += partial
+    return result
+
+
+def _find_line_end(text: str) -> tuple[int, int]:
+    """Find the next line terminator in text.
+
+    Only "\n" ends a line here. The other characters ``str.splitlines`` treats
+    as line breaks are not terminators, so the text the client receives keeps
+    them, and a line that starts with a carriage return is still the line it
+    belongs to.
+
+    Args:
+        text: Text to search.
+
+    Returns:
+        tuple[int, int]: Where the terminator starts and how long it is, or
+        (-1, 0) when the text holds no terminator.
+    """
+    newline = text.find("\n")
+    if newline == -1:
+        return -1, 0
+    return newline, 1
 
 
 def tool_message(tool_call: dict[str, Any]) -> dict[str, Any]:
@@ -1427,7 +1533,7 @@ def chat_completions() -> tuple[Response, int] | Response:
 
 def stream_response(
     upstream: requests.Response, data: dict[str, Any], model: str
-) -> Generator[str, None, None]:
+) -> _ClosingStream:
     """Stream response back to client with robust tool call buffering protection and standard OpenAI formats.
 
     Args:
@@ -1435,10 +1541,74 @@ def stream_response(
         data: Core user request body.
         model: Target model indicator.
 
-    Yields:
-        Generator[str, None, None]: Server-Sent Event chunk sequences.
+    Returns:
+        _ClosingStream: The event-stream chunks. Closing it closes the upstream
+        response.
     """
+    return _ClosingStream(upstream, _stream_body(upstream, data, model))
+
+
+class _ClosingStream:
+    """Iterator over the event-stream chunks that closes the upstream response.
+
+    Werkzeug closes the iterable it is given when the request ends. A plain
+    generator runs its cleanup only once it has started, so the upstream
+    response is closed here as well: this wrapper closes it even when it is
+    closed before the first chunk has been read.
+    """
+
+    def __init__(
+        self, upstream: requests.Response, chunks: Generator[str, None, None]
+    ) -> None:
+        """Store the upstream response and the chunk iterator.
+
+        Args:
+            upstream: The upstream response to close.
+            chunks: The iterator producing the event-stream chunks.
+        """
+        self._upstream = upstream
+        self._chunks = chunks
+        self._closed = False
+
+    def __iter__(self) -> _ClosingStream:
+        """Return this iterator.
+
+        Returns:
+            _ClosingStream: This iterator.
+        """
+        return self
+
+    def __next__(self) -> str:
+        """Return the next event-stream chunk.
+
+        The upstream response is closed when the stream ends or fails, so the
+        connection is never left open.
+
+        Returns:
+            str: The next chunk.
+        """
+        try:
+            return next(self._chunks)
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        """Close the chunk iterator and the upstream response."""
+        if self._closed:
+            return
+        self._closed = True
+        self._chunks.close()
+        self._upstream.close()
+
+
+def _stream_body(
+    upstream: requests.Response, data: dict[str, Any], model: str
+) -> Generator[str, None, None]:
+    """Yield the event-stream chunks for the upstream response."""
     buffered_text = ""
+    at_line_start = True
+    dropping_line = False
     tail_size = 200
     current_event = None
     stream_id = f"chatcmpl-{uuid.uuid4()}"
@@ -1554,6 +1724,9 @@ def stream_response(
                     call = parse_tool_text(buffered_text, tools)
                     if call:
                         yield from emit_tool_call(call)
+                        # The gateway stops reading the upstream here, so the
+                        # response is released now.
+                        upstream.close()
                         yield "data: [DONE]\n\n"
                         return
                     else:
@@ -1562,18 +1735,64 @@ def stream_response(
                     in_tool_buffering = False
 
             if not in_tool_buffering:
-                if len(buffered_text) > tail_size:
-                    flush = buffered_text[:-tail_size]
-                    if flush:
-                        cleaned = clean_text(flush)
-                        chunk = emit_content_chunk(cleaned)
+                # Emit every complete line. The crawl-status filter only sees
+                # lines that really begin a line: the buffer can start in the
+                # middle of one, and such a fragment is never a crawl-status
+                # line and is never dropped.
+                while True:
+                    index, length = _find_line_end(buffered_text)
+                    if index == -1:
+                        break
+                    line = buffered_text[:index]
+                    terminator = buffered_text[index : index + length]
+                    buffered_text = buffered_text[index + length :]
+                    if dropping_line:
+                        dropping_line = False
+                    elif not (at_line_start and _is_crawl_line(line)):
+                        chunk = emit_content_chunk(line + terminator)
                         if chunk:
                             yield chunk
-                    buffered_text = buffered_text[-tail_size:]
+                    at_line_start = True
 
-    text = clean_text(buffered_text)
-    if text:
-        chunk = emit_content_chunk(text)
+                if dropping_line:
+                    # The crawl-status line continues and its text is dropped.
+                    # The last part of it is kept, so that a tool call on the
+                    # same line is still detected instead of vanishing with the
+                    # line.
+                    if len(buffered_text) > tail_size:
+                        buffered_text = buffered_text[-tail_size:]
+                        at_line_start = False
+                else:
+                    keep = tail_size
+                    if at_line_start:
+                        decision = _crawl_decision(buffered_text)
+                        if decision == "crawl":
+                            # The line is a crawl-status line: drop it.
+                            dropping_line = True
+                            keep = len(buffered_text)
+                        elif decision == "undecided":
+                            # The line may still become a crawl-status line, so
+                            # hold it back. The cap keeps the buffer bounded.
+                            keep = min(len(buffered_text), CRAWL_HOLDBACK_MAX)
+                    if len(buffered_text) > keep:
+                        cut = len(buffered_text) - keep
+                        chunk = emit_content_chunk(buffered_text[:cut])
+                        if chunk:
+                            yield chunk
+                        buffered_text = buffered_text[cut:]
+                        # The cut is inside a line, so the buffer no longer
+                        # starts at a line beginning.
+                        at_line_start = False
+
+    if dropping_line:
+        # The stream ended inside a crawl-status line.
+        buffered_text = ""
+    elif buffered_text:
+        # The buffer can hold more than one line when a tool call was never
+        # finished, so the crawl-status lines among them are dropped here too.
+        buffered_text = _drop_crawl_lines(buffered_text, at_line_start)
+    if buffered_text:
+        chunk = emit_content_chunk(buffered_text)
         if chunk:
             yield chunk
 

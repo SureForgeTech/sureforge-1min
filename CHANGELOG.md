@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- [FIX] Streamed chat completions keep the upstream text byte for byte: the crawl-status filter now applies to complete lines only, whitespace is no longer stripped at a flush boundary, and the upstream response is closed on every exit path. A line in a stream ends only at a newline, so a crawl-status line preceded by a carriage return is no longer dropped, and the streaming path keeps characters that the non-streaming path rewrites. A crawl-status line is dropped whole while it is still undecided and fits in the holdback of 8192 characters; a longer line that is still undecided may be streamed as text.
 - [INTERNAL] Pull requests are now welcome with a DCO sign-off (`git commit -s`): the organization contributing guide says so, and a new `dco` workflow checks the sign-off on pull requests from outside contributors.
 - [INTERNAL] The licence changes from MIT to Apache-2.0, with a NOTICE file. Releases published before this change keep the MIT licence they shipped with; only new releases carry Apache-2.0.
 - [INTERNAL] The copyright holder in `LICENSE` and the author in `pyproject.toml` are now SureForgeTech; the MIT licence text is unchanged.
