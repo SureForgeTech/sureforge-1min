@@ -1000,6 +1000,8 @@ def test_one_slow_feature_does_not_block_another(monkeypatch):
     """A feature that is slow to fetch does not hold up the other features."""
     import threading
 
+    holding = threading.Event()
+
     class SlowSession:
         def __init__(self) -> None:
             self.calls = 0
@@ -1008,6 +1010,8 @@ def test_one_slow_feature_does_not_block_another(monkeypatch):
             self.calls += 1
             feature = kwargs.get("params", {}).get("feature")
             if feature == "SLOW":
+                # The slow fetch holds the lock of its feature while it waits.
+                holding.set()
                 import time as time_module
 
                 time_module.sleep(0.5)
@@ -1017,15 +1021,13 @@ def test_one_slow_feature_does_not_block_another(monkeypatch):
     monkeypatch.setattr(server, "get_session", lambda: session)
 
     slow: list[Any] = []
-    started = threading.Event()
 
     def slow_worker() -> None:
-        started.set()
         slow.append(server.fetch_catalog("SLOW"))
 
     thread = threading.Thread(target=slow_worker)
     thread.start()
-    started.wait()
+    assert holding.wait(5)
     began = time.monotonic()
     assert server.fetch_catalog("FAST") == [{"id": "m"}]
     elapsed = time.monotonic() - began
@@ -1078,3 +1080,45 @@ def test_the_image_endpoint_checks_the_prompt_before_the_catalog(monkeypatch):
 
     assert response.status_code == 400
     assert response.json["error"]["message"] == "No prompt provided."
+
+
+def test_a_malformed_catalog_response_does_not_replace_a_good_copy(monkeypatch):
+    """A response the gateway does not understand is a failure, not a catalogue."""
+    session = FakeCatalogSession([{"id": "gpt-4o"}])
+    monkeypatch.setattr(server, "get_session", lambda: session)
+
+    assert server.fetch_catalog("IMAGE_GENERATOR") == [{"id": "gpt-4o"}]
+
+    # The upstream answers with a shape the gateway does not know.
+    class MalformedSession:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def get(self, *args: Any, **kwargs: Any) -> FakeHTTPResponse:
+            self.calls += 1
+            return FakeHTTPResponse(text=json.dumps({}))
+
+    monkeypatch.setattr(server, "get_session", lambda: MalformedSession())
+    state = server._catalog_state("IMAGE_GENERATOR")
+    state.fetched_at = 0.0
+    state.failed_at = 0.0
+
+    # The good copy is still served.
+    assert server.fetch_catalog("IMAGE_GENERATOR") == [{"id": "gpt-4o"}]
+
+
+def test_a_malformed_catalog_response_is_reported_when_there_is_no_copy(monkeypatch):
+    """A response the gateway does not understand is reported as unavailable."""
+
+    class MalformedSession:
+        def get(self, *args: Any, **kwargs: Any) -> FakeHTTPResponse:
+            return FakeHTTPResponse(text=json.dumps({"models": "not a list"}))
+
+    monkeypatch.setattr(server, "get_session", lambda: MalformedSession())
+
+    assert server.fetch_catalog("IMAGE_GENERATOR") is None
+
+    client = server.app.test_client()
+    response = client.get("/v1/models")
+    assert response.status_code == 503
+    assert response.json["error"]["code"] == "catalog_unavailable"

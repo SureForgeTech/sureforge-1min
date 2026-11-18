@@ -242,9 +242,11 @@ class _CatalogState:
     failing upstream does not empty the catalog. The copy is None until one was
     fetched; a catalog that was fetched and holds no models is kept as an empty
     tuple, so that an upstream that answers without models is not asked again
-    for every request. The failure is remembered for a short while, so that a
-    burst of requests does not hammer the upstream. The copy is served for as
-    long as the upstream is down, which is the trade-off of keeping it.
+    for every request. A response whose shape the gateway does not know is a
+    failure, so it never replaces a good copy. The failure is remembered for a
+    short while, so that a burst of requests does not hammer the upstream. The
+    copy is served for as long as the upstream is down, which is the trade-off
+    of keeping it.
     """
 
     entries: tuple[dict[str, Any], ...] | None = None
@@ -291,10 +293,11 @@ def _request_catalog(feature: str) -> tuple[dict[str, Any], ...]:
     )
     response.raise_for_status()
     data = response.json()
-    models = data.get("models") if isinstance(data, dict) else []
-    if not isinstance(models, list):
-        models = []
-    return tuple(entry for entry in models if isinstance(entry, dict))
+    if not isinstance(data, dict) or not isinstance(data.get("models"), list):
+        # The upstream answered with a shape the gateway does not know. That
+        # is a failure, not an empty catalogue: the last good one is kept.
+        raise ValueError("the model catalog response has an unexpected shape")
+    return tuple(entry for entry in data["models"] if isinstance(entry, dict))
 
 
 def _catalog_retry() -> float:
