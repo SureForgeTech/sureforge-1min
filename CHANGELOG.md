@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- [FEATURE] A streamed answer can carry the token usage: a request with `stream_options.include_usage` now gets a last chunk with the token counts, as the OpenAI API does. The counts are made of a word, a number or a mark of punctuation each, which needs no model file and no network; the token counts of a non-streamed answer change with them, because they were counted as a quarter of the characters before.
+
 - [FIX] A request the upstream declined with 429 or 503 is sent again, with a wait that grows with every attempt, or the longer wait the upstream asks for in its Retry-After header, whether it holds a number of seconds or a date, up to the longest wait the gateway allows; a file that can be rewound is sent again whole, and a request whose file cannot be rewound is not sent again, because it would upload nothing; a request that failed in the network is not sent again either, because the upstream may have handled it.
 
 - [SECURITY] Request bodies are bounded: a body larger than `MAX_REQUEST_BYTES` (32 MB by default) is refused with `413`, instead of being held in memory, and an inline base64 image over the image limit is refused; a payload far over the limit is refused before it is decoded at all. The budget is for the whole request, so the inline images of a request share it: two images of the image limit fit, three do not. A body of one megabyte more than the limit is refused by the server in front, with a plain-text `413`.

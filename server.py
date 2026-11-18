@@ -18,7 +18,7 @@ import uuid
 import ipaddress
 from importlib import metadata
 from io import BytesIO
-from typing import Any, Generator
+from typing import Any, Generator, Iterator
 from urllib.parse import urlparse, urljoin
 
 import requests
@@ -1739,17 +1739,125 @@ def extract_result_text(data: dict[str, Any]) -> str | None:
     return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
 
 
-# 11. Accurate Optional Token Counting (tiktoken)
-try:
-    import tiktoken
+# The pieces a token is made of: a word, a number, or a mark of punctuation.
+_TOKEN_PIECE = re.compile(r"\w+|[^\w\s]")
+# The longest piece that is carried from one piece of text to the next. A
+# longer one is counted as it is, so that the buffer stays bounded. It is far
+# longer than any word a model writes.
+MAX_TOKEN_LENGTH = 65536
 
-    _encoder = tiktoken.get_encoding("cl100k_base")
-except ImportError:
-    _encoder = None
+
+def stream_with_usage(
+    chunks: Iterator[str], prompt_tokens: int
+) -> Generator[str, None, None]:
+    """Add a usage chunk to a stream of event-stream chunks.
+
+    The chunk is sent when the caller asked for it with
+    ``stream_options.include_usage``, and it carries the token counts of the
+    request and of the answer. It names the same completion as the answer it
+    reports on, with the id and the model the other chunks carry.
+
+    A tool call is not counted as text: the answer of a tool call is the call
+    itself, which is reported in its own chunk.
+
+    Args:
+        chunks: The event-stream chunks of the answer.
+        prompt_tokens: The number of tokens of the request.
+
+    Yields:
+        Generator[str, None, None]: The event-stream chunks, with the usage
+        chunk before the last one.
+    """
+    counter = _TokenCounter()
+    stream_id = ""
+    model = ""
+    created = 0
+    try:
+        for chunk in chunks:
+            text, chunk_id, chunk_model, chunk_created = _chunk_parts(chunk)
+            if chunk_id:
+                stream_id = chunk_id
+            if chunk_model:
+                model = chunk_model
+            if chunk_created and not created:
+                created = chunk_created
+            if chunk.startswith("data: [DONE]"):
+                completion_tokens = counter.total()
+                yield (
+                    "data: "
+                    + json.dumps(
+                        {
+                            "id": stream_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [],
+                            "usage": {
+                                "prompt_tokens": prompt_tokens,
+                                "completion_tokens": completion_tokens,
+                                "total_tokens": prompt_tokens + completion_tokens,
+                            },
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n\n"
+                )
+                yield chunk
+                continue
+            counter.add(text)
+            yield chunk
+    finally:
+        # The chunks are closed with the wrapper, so that the upstream response
+        # is released when the caller stops reading.
+        close = getattr(chunks, "close", None)
+        if close is not None:
+            close()
+
+
+def _chunk_parts(chunk: str) -> tuple[str, str, str, int]:
+    """Read an event-stream chunk.
+
+    Args:
+        chunk: One event-stream chunk.
+
+    Returns:
+        tuple[str, str, str, int]: The text of the chunk (empty when it
+        carries none), the id of the completion it belongs to, the model it
+        names and the time the completion was created.
+    """
+    if not chunk.startswith("data: ") or chunk.startswith("data: [DONE]"):
+        return "", "", "", 0
+    try:
+        body = json.loads(chunk[len("data: ") :].strip())
+    except json.JSONDecodeError:
+        return "", "", "", 0
+    if not isinstance(body, dict):
+        return "", "", "", 0
+    text = ""
+    choices = body.get("choices")
+    if isinstance(choices, list):
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            delta = choice.get("delta")
+            if isinstance(delta, dict):
+                text += str(delta.get("content") or "")
+    created = body.get("created")
+    return (
+        text,
+        str(body.get("id") or ""),
+        str(body.get("model") or ""),
+        created if isinstance(created, int) else 0,
+    )
 
 
 def token_count(text: str) -> int:
-    """Estimate or accurately calculate the token count for response metrics tracking.
+    """Count the tokens of a text.
+
+    A word, a number and a mark of punctuation are each one token, which is
+    close to what the tokenisers of the model providers produce. The count
+    needs no model file and no network, so it is the same in every
+    deployment.
 
     Args:
         text: Core input string.
@@ -1757,12 +1865,50 @@ def token_count(text: str) -> int:
     Returns:
         int: The token count integer.
     """
-    if _encoder is not None:
-        try:
-            return len(_encoder.encode(text, disallowed_special=()))
-        except Exception:
-            pass
-    return max(1, len(text) // 4)
+    return max(1, len(_TOKEN_PIECE.findall(text)))
+
+
+class _TokenCounter:
+    """Count the tokens of a text that arrives in pieces.
+
+    A word that was cut in half by the end of a piece is counted with the next
+    piece, so the count does not depend on where the text was split.
+    """
+
+    def __init__(self) -> None:
+        """Start a count of zero."""
+        self._count = 0
+        self._carry = ""
+
+    def add(self, text: str) -> None:
+        """Count the tokens of a piece of text.
+
+        Args:
+            text: The piece that arrived.
+        """
+        text = self._carry + text
+        self._carry = ""
+        if text and not text[-1].isspace() and (text[-1].isalnum() or text[-1] == "_"):
+            end = len(text)
+            while end > 0 and (text[end - 1].isalnum() or text[end - 1] == "_"):
+                end -= 1
+            word = text[end:]
+            if len(word) > MAX_TOKEN_LENGTH:
+                # A token this long is counted as it is and not carried
+                # further, so that the buffer does not grow without bound.
+                self._count += len(_TOKEN_PIECE.findall(word))
+                word = ""
+            self._carry = word
+            text = text[:end]
+        self._count += len(_TOKEN_PIECE.findall(text))
+
+    def total(self) -> int:
+        """Return the number of tokens counted so far.
+
+        Returns:
+            int: The number of tokens.
+        """
+        return max(1, self._count + len(_TOKEN_PIECE.findall(self._carry)))
 
 
 # 3. Application Factory Blueprint & 10. Trailing Slashes support
@@ -1864,9 +2010,13 @@ def chat_completions() -> tuple[Response, int] | Response:
         )
         if upstream.status_code != 200:
             return upstream_error(upstream)
-        return Response(
-            stream_response(upstream, data, model), content_type="text/event-stream"
-        )
+        stream: Iterator[str] = stream_response(upstream, data, model)
+        options = data.get("stream_options")
+        if isinstance(options, dict) and options.get("include_usage") is True:
+            stream = stream_with_usage(
+                stream, token_count(payload["promptObject"]["prompt"])
+            )
+        return Response(stream, content_type="text/event-stream")
 
     # Use connection pool session
     upstream = post_upstream(

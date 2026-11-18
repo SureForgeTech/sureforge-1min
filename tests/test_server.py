@@ -486,9 +486,8 @@ def test_vision_flexible_payload_formats():
     assert imgs == ["https://example.com/img2.png"]
 
 
-def test_tiktoken_accurate_counting(monkeypatch):
-    """Verify that token_count handles tiktoken encoding safely or falls back."""
-    # If tiktoken is loaded, it should count accurately
+def test_token_count_is_positive():
+    """Verify that a token count is never zero."""
     cnt = server.token_count("Hello world! How are you?")
     assert cnt > 0
 
@@ -2597,3 +2596,237 @@ def test_a_crawl_status_line_at_the_end_without_a_newline_is_dropped():
     received = _streamed_content(server.stream_response(FakeResponse(), {}, "m"))
 
     assert received == "<tool_call\n"
+
+
+class StreamingSession:
+    """Session mock that streams a canned answer and serves a catalog."""
+
+    def __init__(self, content: str) -> None:
+        self.content = content
+
+    def get(self, *args: Any, **kwargs: Any) -> FakeHTTPResponse:
+        return FakeHTTPResponse(text=json.dumps({"models": [{"id": "gpt-4o"}]}))
+
+    def post(self, *args: Any, **kwargs: Any) -> Any:
+        payload = json.dumps({"delta": {"content": self.content}})
+        response = FakeHTTPResponse(text="")
+        response.status_code = 200
+        response.iter_lines = lambda decode_unicode=False: [
+            f"data: {payload}".encode("utf-8")
+        ]
+        return response
+
+
+def _stream_request() -> dict[str, Any]:
+    return {
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": True,
+    }
+
+
+def test_a_stream_reports_the_usage_when_the_caller_asks_for_it(monkeypatch):
+    """A stream that was asked for carries the token counts."""
+    monkeypatch.setattr(server, "get_session", lambda: StreamingSession("hello world"))
+    client = server.app.test_client()
+
+    body = client.post(
+        "/v1/chat/completions",
+        json={**_stream_request(), "stream_options": {"include_usage": True}},
+        headers={"Authorization": "Bearer fake-key"},
+    ).get_data(as_text=True)
+
+    frames = [
+        json.loads(line[len("data: ") :])
+        for line in body.split("\n\n")
+        if line.startswith("data: ") and not line.startswith("data: [DONE]")
+    ]
+    usage_frame = next(f for f in frames if "usage" in f)
+    content_frame = next(f for f in frames if f.get("choices"))
+
+    # The usage chunk is a chunk of the same completion, with no choices.
+    assert usage_frame["choices"] == []
+    assert usage_frame["object"] == "chat.completion.chunk"
+    assert usage_frame["id"] == content_frame["id"]
+    assert usage_frame["model"] == content_frame["model"]
+    # The usage chunk carries the time of the answer, not the time the
+    # wrapper started.
+    assert usage_frame["created"] == content_frame["created"]
+
+    # The prompt and the answer are counted apart: the answer is the text the
+    # gateway sent.
+    usage = usage_frame["usage"]
+    assert usage["completion_tokens"] == server.token_count("hello world")
+    assert usage["prompt_tokens"] > 0
+    assert usage["prompt_tokens"] != usage["completion_tokens"]
+    assert usage["total_tokens"] == (
+        usage["prompt_tokens"] + usage["completion_tokens"]
+    )
+
+    # The finish-reason chunk is still there, and the usage chunk comes last.
+    assert any(f["choices"][0].get("finish_reason") for f in frames if f["choices"])
+    assert frames.index(usage_frame) == len(frames) - 1
+
+
+def test_a_stream_has_no_usage_chunk_by_default(monkeypatch):
+    """A stream that was not asked for carries no usage."""
+    monkeypatch.setattr(server, "get_session", lambda: StreamingSession("hello world"))
+    client = server.app.test_client()
+
+    body = client.post(
+        "/v1/chat/completions",
+        json=_stream_request(),
+        headers={"Authorization": "Bearer fake-key"},
+    ).get_data(as_text=True)
+
+    assert '"usage"' not in body
+
+
+def test_the_token_count_counts_words_and_marks():
+    """The token count is a word, a number or a mark of punctuation each."""
+    assert server.token_count("one two three") == 3
+    assert server.token_count("Hello world! How are you?") == 7
+    assert server.token_count("") == 1
+
+
+def test_the_token_count_does_not_depend_on_where_the_text_was_split():
+    """A word split over two pieces is still one token."""
+    whole = server._TokenCounter()
+    whole.add("hello world")
+    split = server._TokenCounter()
+    split.add("hello wo")
+    split.add("rld")
+    assert whole.total() == split.total()
+
+
+def test_the_usage_wrapper_closes_the_chunks_it_wraps():
+    """The chunks are closed with the wrapper, so the upstream is released."""
+    closed = []
+
+    class ClosingChunks:
+        def __init__(self) -> None:
+            self.done = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.done:
+                raise StopIteration
+            self.done = True
+            return "data: [DONE]\n\n"
+
+        def close(self):
+            closed.append(True)
+
+    stream = server.stream_with_usage(ClosingChunks(), 3)
+    events = list(stream)
+    assert events[-1] == "data: [DONE]\n\n"
+    assert '"usage"' in events[0]
+    assert closed == [True]
+
+
+def test_the_usage_wrapper_closes_the_chunks_when_it_is_stopped():
+    """The chunks are closed when the caller stops reading."""
+    closed = []
+
+    class ClosingChunks:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return "data: {}\n\n"
+
+        def close(self):
+            closed.append(True)
+
+    stream = server.stream_with_usage(ClosingChunks(), 3)
+    next(stream)
+    stream.close()
+    assert closed == [True]
+
+
+def test_the_usage_chunk_names_the_same_completion_as_the_answer(monkeypatch):
+    """The usage chunk carries the id and the model of the answer it reports on."""
+    monkeypatch.setattr(server, "get_session", lambda: StreamingSession("hello world"))
+    client = server.app.test_client()
+
+    body = client.post(
+        "/v1/chat/completions",
+        json={**_stream_request(), "stream_options": {"include_usage": True}},
+        headers={"Authorization": "Bearer fake-key"},
+    ).get_data(as_text=True)
+
+    frames = [
+        json.loads(line[len("data: ") :])
+        for line in body.split("\n\n")
+        if line.startswith("data: ") and not line.startswith("data: [DONE]")
+    ]
+    content_frame = next(f for f in frames if f["choices"])
+    usage_frame = next(f for f in frames if "usage" in f)
+    assert usage_frame["id"] == content_frame["id"]
+    assert usage_frame["model"] == content_frame["model"] == "gpt-4o"
+
+
+def test_stream_options_of_the_wrong_type_is_ignored(monkeypatch):
+    """A stream_options that is not an object does not break the request."""
+    monkeypatch.setattr(server, "get_session", lambda: StreamingSession("hello world"))
+    client = server.app.test_client()
+
+    for options in ("include_usage", 7, ["include_usage"]):
+        response = client.post(
+            "/v1/chat/completions",
+            json={**_stream_request(), "stream_options": options},
+            headers={"Authorization": "Bearer fake-key"},
+        )
+        assert response.status_code == 200
+        assert '"usage"' not in response.get_data(as_text=True)
+
+
+def test_include_usage_must_be_true(monkeypatch):
+    """A value that is not true does not turn the usage on."""
+    monkeypatch.setattr(server, "get_session", lambda: StreamingSession("hello world"))
+    client = server.app.test_client()
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={**_stream_request(), "stream_options": {"include_usage": "false"}},
+        headers={"Authorization": "Bearer fake-key"},
+    )
+
+    assert response.status_code == 200
+    assert '"usage"' not in response.get_data(as_text=True)
+
+
+def test_the_carried_text_stays_bounded():
+    """The counter does not carry more than the limit."""
+    counter = server._TokenCounter()
+
+    for _ in range(10):
+        counter.add("y" * 10000)
+
+    assert len(counter._carry) <= server.MAX_TOKEN_LENGTH
+
+
+def test_the_usage_chunk_carries_the_time_of_the_answer(monkeypatch):
+    """The usage chunk carries the time of the answer, not of the wrapper."""
+    ticks = iter(range(1700000000, 1700000100, 2))
+    monkeypatch.setattr(server.time, "time", lambda: next(ticks))
+    monkeypatch.setattr(server, "get_session", lambda: StreamingSession("hello world"))
+
+    client = server.app.test_client()
+    body = client.post(
+        "/v1/chat/completions",
+        json={**_stream_request(), "stream_options": {"include_usage": True}},
+        headers={"Authorization": "Bearer fake-key"},
+    ).get_data(as_text=True)
+
+    frames = [
+        json.loads(line[len("data: ") :])
+        for line in body.split("\n\n")
+        if line.startswith("data: ") and not line.startswith("data: [DONE]")
+    ]
+    usage_frame = next(f for f in frames if "usage" in f)
+    content_frame = next(f for f in frames if f.get("choices"))
+
+    assert usage_frame["created"] == content_frame["created"]
