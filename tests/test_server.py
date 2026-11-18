@@ -1,4 +1,5 @@
 import base64
+import io
 import json
 from typing import Any, Generator
 import pytest
@@ -830,6 +831,9 @@ def test_request_body_within_the_limit_is_accepted(monkeypatch):
     monkeypatch.setattr(server.config, "MAX_REQUEST_BYTES", 1024 * 1024)
 
     class FakeSession:
+        def get(self, *args: Any, **kwargs: Any) -> FakeHTTPResponse:
+            return FakeHTTPResponse(text=json.dumps({"models": [{"id": "gpt-4o"}]}))
+
         def post(self, *args: Any, **kwargs: Any) -> FakeHTTPResponse:
             return FakeHTTPResponse(
                 text=json.dumps(
@@ -882,4 +886,91 @@ def test_main_passes_the_body_limit_to_waitress(monkeypatch):
     monkeypatch.setattr(server, "serve", fake_serve)
     server.main()
 
-    assert captured["max_request_body_size"] == server.config.MAX_REQUEST_BYTES
+    # The server in front is a last resort: the application refuses the body
+    # first, so that the answer carries the OpenAI error shape.
+    assert captured["max_request_body_size"] > server.config.MAX_REQUEST_BYTES
+
+
+def test_a_body_without_a_declared_length_is_refused(monkeypatch):
+    """A request that declares no length is refused when it is too large."""
+    monkeypatch.setattr(server.config, "MAX_REQUEST_BYTES", 1024)
+
+    class Stream:
+        """A request body whose length is not declared."""
+
+        def __init__(self) -> None:
+            self.data = b"x" * 4096
+            self.position = 0
+
+        def read(self, size: int = -1) -> bytes:
+            if size is None or size < 0:
+                size = len(self.data) - self.position
+            chunk = self.data[self.position : self.position + size]
+            self.position += len(chunk)
+            return chunk
+
+    environ = {
+        "REQUEST_METHOD": "POST",
+        "PATH_INFO": "/v1/chat/completions",
+        "CONTENT_TYPE": "application/json",
+        "HTTP_AUTHORIZATION": "Bearer fake-key",
+        "wsgi.input": Stream(),
+        "wsgi.url_scheme": "http",
+        "SERVER_NAME": "localhost",
+        "SERVER_PORT": "80",
+        "wsgi.errors": io.StringIO(),
+        "wsgi.version": (1, 0),
+        "wsgi.multithread": False,
+        "wsgi.multiprocess": False,
+        "wsgi.run_once": False,
+    }
+    captured: dict[str, str] = {}
+
+    def start_response(status: str, headers: Any, exc_info: Any = None) -> Any:
+        captured["status"] = status
+        return lambda data: None
+
+    body = b"".join(server.create_app()(environ, start_response))
+
+    assert "413" in captured["status"]
+    assert b"request_too_large" in body
+
+
+def test_an_image_of_the_limit_plus_one_is_refused(monkeypatch):
+    """An image of one byte over the limit is refused, and the size is exact."""
+    monkeypatch.setattr(server.config, "MAX_IMAGE_BYTES", 16)
+    encoded = base64.b64encode(b"x" * 17).decode()
+    decoded = []
+    real_decode = server.base64.b64decode
+
+    def spy(*args: Any, **kwargs: Any) -> bytes:
+        decoded.append(True)
+        return real_decode(*args, **kwargs)
+
+    monkeypatch.setattr(server.base64, "b64decode", spy)
+
+    with server.app.app_context():
+        result = server.decode_data_image(f"data:image/png;base64,{encoded}")
+
+    assert isinstance(result, tuple)
+    assert result[1] == 413
+    # A payload of one byte more can have the same text length, so it is
+    # decoded to learn its size.
+    assert decoded
+
+
+def test_a_far_too_large_image_is_refused_without_being_decoded(monkeypatch):
+    """An image that is far over the limit is refused before it is decoded."""
+    monkeypatch.setattr(server.config, "MAX_IMAGE_BYTES", 16)
+    encoded = base64.b64encode(b"x" * 4096).decode()
+
+    def fail(*args: Any, **kwargs: Any) -> bytes:
+        raise AssertionError("the payload must not be decoded")
+
+    monkeypatch.setattr(server.base64, "b64decode", fail)
+
+    with server.app.app_context():
+        result = server.decode_data_image(f"data:image/png;base64,{encoded}")
+
+    assert isinstance(result, tuple)
+    assert result[1] == 413

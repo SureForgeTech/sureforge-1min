@@ -39,7 +39,7 @@ from flask import (
     g,
     has_request_context,
 )
-from werkzeug.exceptions import BadRequest, HTTPException, RequestEntityTooLarge
+from werkzeug.exceptions import HTTPException, RequestEntityTooLarge
 from werkzeug.http import HTTP_STATUS_CODES
 from waitress import serve
 
@@ -428,15 +428,36 @@ def request_json() -> dict[str, Any] | tuple[Response, int]:
         dict[str, Any] | tuple[Response, int]: Parsed JSON dict or Flask error response.
     """
     # 12. Improved Empty Request Body Parsing
-    if not request.data:
+    # The body is read with a limit of its own. The declared length is
+    # refused by the framework, but a request that declares no length would
+    # otherwise be read to its end.
+    limit = config.MAX_REQUEST_BYTES
+    if request.content_length is not None and request.content_length > limit:
+        return error_response(
+            f"The request body is larger than {limit} bytes.",
+            413,
+            "request_too_large",
+        )
+    # The body is read from the raw input with a limit of its own. The
+    # framework cuts a body whose length is not declared short without a
+    # word, so the excess would go unnoticed.
+    raw = request.environ.get("wsgi.input")
+    body = raw.read(limit + 1) if raw is not None else b""
+    if len(body) > limit:
+        return error_response(
+            f"The request body is larger than {limit} bytes.",
+            413,
+            "request_too_large",
+        )
+    if not body:
         return error_response(
             "Empty request body. Please provide a valid JSON object.",
             400,
             "empty_request_body",
         )
     try:
-        data = request.get_json(force=True)
-    except BadRequest:
+        data = json.loads(body)
+    except ValueError:
         return error_response("Invalid JSON body.", 400, "invalid_json")
     if not isinstance(data, dict):
         return error_response(
@@ -1090,9 +1111,11 @@ def decode_data_image(image_url: str) -> BytesIO | tuple[Response, int]:
         encoded = image_url.split(",", 1)[1]
     except IndexError:
         return error_response("Invalid image data URL.", 400, "invalid_image")
-    # The encoded text is measured before it is decoded, so an oversized
-    # payload is never turned into bytes in memory.
-    if len(encoded) > 4 * ((config.MAX_IMAGE_BYTES + 2) // 3):
+    # The encoded text is measured before it is decoded, so a payload that is
+    # far over the limit is never turned into bytes in memory. The bound is
+    # the longest text a payload within the limit can have, because a payload
+    # of one byte more can have the same text length.
+    if len(encoded) > 4 * ((config.MAX_IMAGE_BYTES + 4) // 3):
         return error_response("Image payload is too large.", 413, "image_too_large")
     try:
         payload = base64.b64decode(encoded, validate=True)
@@ -1773,7 +1796,10 @@ def main() -> None:
         host=config.HOST,
         port=config.PORT,
         threads=config.WAITRESS_THREADS,
-        max_request_body_size=config.MAX_REQUEST_BYTES,
+        # The limit of the server in front is a little larger than the limit of
+        # the application, so that the application refuses the body and the
+        # answer carries the OpenAI error shape.
+        max_request_body_size=config.MAX_REQUEST_BYTES + 1024 * 1024,
     )
 
 
