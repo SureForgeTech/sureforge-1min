@@ -97,13 +97,16 @@ class GatewayConfig:
         except ValueError:
             self.WAITRESS_THREADS = 8
 
-        # The retry settings may not be negative: a negative wait would fail
-        # the request instead of waiting.
-        self.MAX_UPSTREAM_RETRIES = max(0, self.MAX_UPSTREAM_RETRIES)
+        # The retry settings may not be negative and may not be endless: a
+        # negative wait would fail the request instead of waiting, and an
+        # endless one would hold it for ever.
+        self.MAX_UPSTREAM_RETRIES = max(0, min(self.MAX_UPSTREAM_RETRIES, 10))
         self.UPSTREAM_RETRY_BACKOFF_SECONDS = max(
-            0.0, self.UPSTREAM_RETRY_BACKOFF_SECONDS
+            0.0, min(self.UPSTREAM_RETRY_BACKOFF_SECONDS, 60.0)
         )
-        self.UPSTREAM_RETRY_MAX_SECONDS = max(0.0, self.UPSTREAM_RETRY_MAX_SECONDS)
+        self.UPSTREAM_RETRY_MAX_SECONDS = max(
+            0.0, min(self.UPSTREAM_RETRY_MAX_SECONDS, 60.0)
+        )
 
 
 # Instantiate global settings configuration
@@ -281,10 +284,14 @@ def _rewind_files(kwargs: dict[str, Any]) -> None:
     for value in values:
         stream = _file_stream(value)
         if stream is None:
+            # The value carries no file, so there is nothing to rewind.
+            continue
+        seek = getattr(stream, "seek", None)
+        if seek is None:
             logger.warning("a file that is sent again cannot be rewound")
             continue
         try:
-            stream.seek(0)
+            seek(0)
         except (OSError, ValueError):
             logger.warning("could not rewind a file that is sent again")
 

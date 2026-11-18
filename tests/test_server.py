@@ -1140,3 +1140,58 @@ def test_a_file_that_is_sent_again_is_rewound_in_the_list_form(monkeypatch):
 
     assert session.bodies
     assert all(body == payload for body in session.bodies)
+
+
+def test_a_file_that_cannot_be_rewound_is_skipped(monkeypatch):
+    """A file that has no seek is not sent empty because of the retry."""
+
+    class NonSeekable:
+        def __init__(self) -> None:
+            self.data = b"payload"
+
+        def read(self) -> bytes:
+            return self.data
+
+    class Session:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def post(self, *args: Any, **kwargs: Any) -> FakeHTTPResponse:
+            self.calls += 1
+            return FakeHTTPResponse(status_code=503, text="busy")
+
+    session = Session()
+    monkeypatch.setattr(server, "get_session", lambda: session)
+    monkeypatch.setattr(server.time, "sleep", lambda seconds: None)
+
+    response = server.post_upstream(
+        "asset",
+        "https://example.invalid/assets",
+        files={"asset": ("a.png", NonSeekable(), "image/png")},
+    )
+
+    assert response.status_code == 503
+    assert session.calls == server.config.MAX_UPSTREAM_RETRIES + 1
+
+
+def test_a_value_that_carries_no_file_is_not_reported(caplog):
+    """A value that carries no file is not a file that could be rewound."""
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="one-min-ai-gateway"):
+        server._rewind_files({"files": {"asset": "just a name"}})
+
+    assert not [r for r in caplog.records if "rewound" in r.getMessage()]
+
+
+def test_a_retry_setting_that_is_endless_is_bounded():
+    """A retry setting that is endless is bounded."""
+    config = server.GatewayConfig()
+    config.MAX_UPSTREAM_RETRIES = 1000
+    config.UPSTREAM_RETRY_BACKOFF_SECONDS = float("inf")
+    config.UPSTREAM_RETRY_MAX_SECONDS = float("inf")
+    config.__post_init__()
+
+    assert config.MAX_UPSTREAM_RETRIES <= 10
+    assert config.UPSTREAM_RETRY_BACKOFF_SECONDS <= 60.0
+    assert config.UPSTREAM_RETRY_MAX_SECONDS <= 60.0
