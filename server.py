@@ -3,7 +3,7 @@ from __future__ import annotations
 import atexit
 import base64
 import binascii
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import logging
 import os
@@ -13,7 +13,6 @@ import threading
 import time
 import uuid
 import ipaddress
-from functools import lru_cache
 from importlib import metadata
 from io import BytesIO
 from typing import Any, Generator
@@ -62,6 +61,7 @@ class GatewayConfig:
         "yes",
     )
     CATALOG_TTL_SECONDS: int = int(os.getenv("CATALOG_TTL_SECONDS", "300"))
+    CATALOG_RETRY_SECONDS: int = int(os.getenv("CATALOG_RETRY_SECONDS", "10"))
     MAX_IMAGE_BYTES: int = int(os.getenv("MAX_IMAGE_BYTES", str(10 * 1024 * 1024)))
     # The budget for a whole request. It holds the inline images of a request
     # together: two images of the image limit need about 27 MB.
@@ -237,78 +237,188 @@ def gateway_version() -> str:
         return "0.1.1"
 
 
-def cache_bucket() -> int:
-    """Generate cache bucket key based on the TTL configuration.
+@dataclass
+class _CatalogState:
+    """The last known model catalog of one feature.
 
-    Returns:
-        int: Time-based bucket identifier.
+    A copy of the catalog that was fetched successfully is kept, so that a
+    failing upstream does not empty the catalog. The copy is None until one was
+    fetched; a catalog that was fetched and holds no models is kept as an empty
+    tuple, so that an upstream that answers without models is not asked again
+    for every request. A response whose shape the gateway does not know, or
+    whose entries it cannot read, is a failure, so it never replaces a good
+    copy. The failure is remembered for a
+    short while, so that a burst of requests does not hammer the upstream. The
+    copy is served for as long as the upstream is down, which is the trade-off
+    of keeping it.
     """
-    return (
-        int(time.time() // config.CATALOG_TTL_SECONDS)
-        if config.CATALOG_TTL_SECONDS > 0
-        else int(time.time())
-    )
+
+    entries: tuple[dict[str, Any], ...] | None = None
+    fetched_at: float = 0.0
+    failed_at: float = 0.0
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
 
-# 4. Cache Stampede Protection (Mutex Locking)
-_catalog_mutex = threading.Lock()
+_catalog_states: dict[str, _CatalogState] = {}
+_catalog_states_lock = threading.Lock()
 
 
-@lru_cache(maxsize=32)
-def fetch_catalog_cached(feature: str, _bucket: int) -> tuple[dict[str, Any], ...]:
-    """Fetch model catalog with TTL caching and Cache Stampede protection.
-
-    Args:
-        feature: The model feature identifier.
-        _bucket: The current cache bucket ID.
-
-    Returns:
-        tuple[dict[str, Any], ...]: The models entries catalog.
-    """
-    with _catalog_mutex:
-        try:
-            response = get_session().get(
-                model_api_url(),
-                params={"feature": feature},
-                timeout=30,
-                verify=config.GATEWAY_VERIFY_SSL,
-            )
-            response.raise_for_status()
-            data = response.json()
-        except requests.RequestException as exc:
-            logger.warning(
-                "failed to fetch model catalog for feature %s: %s", feature, exc
-            )
-            return tuple()
-        except ValueError:
-            logger.warning(
-                "failed to parse model catalog response for feature %s", feature
-            )
-            return tuple()
-
-        models = data.get("models") if isinstance(data, dict) else []
-        if not isinstance(models, list):
-            models = []
-        return tuple(entry for entry in models if isinstance(entry, dict))
-
-
-def fetch_catalog(feature: str) -> list[dict[str, Any]]:
-    """Fetch catalog for a given feature using active cache bucket.
+def _catalog_state(feature: str) -> _CatalogState:
+    """Return the cache state of one feature, creating it when needed.
 
     Args:
         feature: The feature identifier.
 
     Returns:
-        list[dict[str, Any]]: List of matching models.
+        _CatalogState: The cache state of the feature.
     """
-    return list(fetch_catalog_cached(feature, cache_bucket()))
+    with _catalog_states_lock:
+        state = _catalog_states.get(feature)
+        if state is None:
+            state = _CatalogState()
+            _catalog_states[feature] = state
+        return state
 
 
-def chat_models() -> list[dict[str, Any]]:
+def _request_catalog(feature: str) -> tuple[dict[str, Any], ...]:
+    """Ask the upstream for the model catalog of one feature.
+
+    Args:
+        feature: The feature identifier.
+
+    Returns:
+        tuple[dict[str, Any], ...]: The catalog entries.
+    """
+    response = get_session().get(
+        model_api_url(),
+        params={"feature": feature},
+        timeout=30,
+        verify=config.GATEWAY_VERIFY_SSL,
+    )
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, dict) or not isinstance(data.get("models"), list):
+        # The upstream answered with a shape the gateway does not know. That
+        # is a failure, not an empty catalogue: the last good one is kept.
+        raise ValueError("the model catalog response has an unexpected shape")
+    entries = tuple(entry for entry in data["models"] if isinstance(entry, dict))
+    if len(entries) != len(data["models"]):
+        raise ValueError(
+            "the model catalog response holds an entry the gateway cannot read"
+        )
+    for entry in entries:
+        if not model_id(entry):
+            raise ValueError(
+                "the model catalog response holds an entry without an identifier"
+            )
+    return entries
+
+
+def _catalog_retry() -> float:
+    """Return how long a failed fetch is remembered.
+
+    An interval of zero or less means one second, so that the upstream is not
+    asked again for every request.
+
+    Returns:
+        float: The number of seconds.
+    """
+    return float(
+        config.CATALOG_RETRY_SECONDS if config.CATALOG_RETRY_SECONDS > 0 else 1
+    )
+
+
+def _catalog_ttl() -> float:
+    """Return how long a fetched catalog is served.
+
+    A TTL of zero or less means the catalog is served for a second, so that
+    the upstream is not asked for it on every request.
+
+    Returns:
+        float: The number of seconds.
+    """
+    return float(config.CATALOG_TTL_SECONDS if config.CATALOG_TTL_SECONDS > 0 else 1)
+
+
+def _catalog_copy(state: _CatalogState, feature: str) -> list[dict[str, Any]] | None:
+    """Return the catalog that was fetched last, if there is one.
+
+    Args:
+        state: The cache state of a feature.
+        feature: The feature identifier.
+
+    Returns:
+        list[dict[str, Any]] | None: The catalog entries, or None when no
+        catalog was ever fetched.
+    """
+    if state.entries is None:
+        return None
+    logger.info("serving the last known model catalog for feature %s", feature)
+    return list(state.entries)
+
+
+def fetch_catalog(feature: str) -> list[dict[str, Any]] | None:
+    """Fetch the catalog of one feature.
+
+    The last catalog that was fetched successfully is served when the upstream
+    fails, so that one blip does not empty the catalog for the whole TTL. A
+    failure is never cached as an empty catalog.
+
+    Args:
+        feature: The feature identifier.
+
+    Returns:
+        list[dict[str, Any]] | None: The catalog entries, or None when the
+        catalog is unavailable and no good copy was ever fetched.
+    """
+    state = _catalog_state(feature)
+    now = time.time()
+    if state.entries is not None and now - state.fetched_at < _catalog_ttl():
+        return list(state.entries)
+    if state.failed_at and now - state.failed_at < _catalog_retry():
+        # A recent attempt failed; the upstream is not asked again yet.
+        return _catalog_copy(state, feature)
+
+    # Only one thread fetches a feature at a time, so that a burst of
+    # requests causes one upstream call. A caller that has a copy to serve
+    # does not wait for the fetch that is already running.
+    if not state.lock.acquire(blocking=state.entries is None):
+        return _catalog_copy(state, feature)
+    try:
+        now = time.time()
+        if state.entries is not None and now - state.fetched_at < _catalog_ttl():
+            return list(state.entries)
+        if state.failed_at and now - state.failed_at < _catalog_retry():
+            # The attempt that held the lock failed; do not start another one.
+            return _catalog_copy(state, feature)
+        try:
+            entries = _request_catalog(feature)
+        except requests.RequestException as exc:
+            state.failed_at = time.time()
+            logger.warning(
+                "failed to fetch model catalog for feature %s: %s", feature, exc
+            )
+            return _catalog_copy(state, feature)
+        except ValueError:
+            state.failed_at = time.time()
+            logger.warning(
+                "failed to parse model catalog response for feature %s", feature
+            )
+            return _catalog_copy(state, feature)
+        state.entries = entries
+        state.fetched_at = time.time()
+        state.failed_at = 0.0
+        return list(entries)
+    finally:
+        state.lock.release()
+
+
+def chat_models() -> list[dict[str, Any]] | None:
     """Fetch chat models from the model catalog.
 
     Returns:
-        list[dict[str, Any]]: List of chat models.
+        list[dict[str, Any]] | None: List of chat models, or None when the
+        catalog is unavailable.
     """
     return fetch_catalog("UNIFY_CHAT_WITH_AI")
 
@@ -330,38 +440,30 @@ def model_id(entry: dict[str, Any]) -> str:
 
 
 # 7. Vision and Image Model ID Sets Cache Optimization (frozenset)
-@lru_cache(maxsize=32)
-def vision_model_ids_cached(_bucket: int) -> frozenset[str]:
-    """Retrieve and cache vision model IDs for the active cache bucket."""
-    return frozenset(
-        model_id(entry) for entry in fetch_catalog("CHAT_WITH_IMAGE") if model_id(entry)
-    )
-
-
-def vision_model_ids() -> frozenset[str]:
-    """Retrieve current set of vision model IDs.
+def vision_model_ids() -> frozenset[str] | None:
+    """Retrieve the current set of vision model IDs.
 
     Returns:
-        frozenset[str]: Set of model IDs supporting image inputs.
+        frozenset[str] | None: Set of model IDs supporting image inputs, or
+        None when the catalog is unavailable.
     """
-    return vision_model_ids_cached(cache_bucket())
+    catalog = fetch_catalog("CHAT_WITH_IMAGE")
+    if catalog is None:
+        return None
+    return frozenset(model_id(entry) for entry in catalog if model_id(entry))
 
 
-@lru_cache(maxsize=32)
-def image_model_ids_cached(_bucket: int) -> frozenset[str]:
-    """Retrieve and cache image generator model IDs for the active cache bucket."""
-    return frozenset(
-        model_id(entry) for entry in fetch_catalog("IMAGE_GENERATOR") if model_id(entry)
-    )
-
-
-def image_model_ids() -> frozenset[str]:
-    """Retrieve current set of image model IDs.
+def image_model_ids() -> frozenset[str] | None:
+    """Retrieve the current set of image model IDs.
 
     Returns:
-        frozenset[str]: Set of model IDs supporting image generation.
+        frozenset[str] | None: Set of model IDs supporting image generation,
+        or None when the catalog is unavailable.
     """
-    return image_model_ids_cached(cache_bucket())
+    catalog = fetch_catalog("IMAGE_GENERATOR")
+    if catalog is None:
+        return None
+    return frozenset(model_id(entry) for entry in catalog if model_id(entry))
 
 
 def error_response(
@@ -641,8 +743,22 @@ def parse_tool_text(text: str, tools: list[dict[str, Any]]) -> dict[str, Any] | 
     return None
 
 
+CRAWL_MARKER = "🌐 Crawling site "
+
+# The most text held back, in characters, while it is still undecided whether
+# the current line is a crawl-status line. The holdback is what lets the
+# filter see the marker after any leading space, so it is generous; a line
+# that is still undecided when it is longer than this is let through rather
+# than held.
+CRAWL_HOLDBACK_MAX = 8192
+
+
 def clean_text(text: str) -> str:
     """Clean specific crawl status lines from output text.
+
+    This is the whole-text path, used where the complete response is
+    available. The streaming path filters at line boundaries instead and
+    keeps the text byte for byte.
 
     Args:
         text: The text to clean.
@@ -651,11 +767,103 @@ def clean_text(text: str) -> str:
         str: Cleaned text content.
     """
     lines = [
-        line
-        for line in text.splitlines()
-        if not line.strip().startswith("🌐 Crawling site ")
+        line for line in text.splitlines() if not line.strip().startswith(CRAWL_MARKER)
     ]
     return "\n".join(lines).strip()
+
+
+def _is_crawl_line(text: str) -> bool:
+    """Return True when a line is a crawl-status line that must be dropped.
+
+    Args:
+        text: One line, without its terminator.
+
+    Returns:
+        bool: True if the line must not reach the client.
+    """
+    return text.strip().startswith(CRAWL_MARKER)
+
+
+def _crawl_decision(text: str) -> str:
+    """Classify a line that is still being received.
+
+    A line is a crawl-status line when its first non-space characters are the
+    crawl marker. While the text seen so far still matches that marker, more
+    text could turn it into a crawl-status line, so the answer stays
+    undecided and the line is held back.
+
+    Args:
+        text: The part of the line received so far.
+
+    Returns:
+        str: "crawl" when the line is a crawl-status line, "clear" when it
+        cannot be one, and "undecided" while more text could change that.
+    """
+    stripped = text.lstrip()
+    if not stripped:
+        return "undecided"
+    if stripped.startswith(CRAWL_MARKER):
+        # The marker is there. It counts only when non-space text follows it,
+        # because the marker on its own is not a crawl-status line.
+        return "crawl" if stripped[len(CRAWL_MARKER) :].strip() else "undecided"
+    if CRAWL_MARKER.startswith(stripped):
+        return "undecided"
+    return "clear"
+
+
+def _drop_crawl_lines(text: str, at_line_start: bool) -> str:
+    """Drop the crawl-status lines among the complete lines of a text.
+
+    The text may hold more than one line, which happens when a tool call was
+    never finished and the line splitting was skipped. The first line is only
+    a crawl-status line when it really begins a line.
+
+    Args:
+        text: Text that holds complete lines and a trailing partial line.
+        at_line_start: Whether the first line of the text begins a line.
+
+    Returns:
+        str: The text without its crawl-status lines.
+    """
+    if "\n" not in text:
+        if at_line_start and _is_crawl_line(text):
+            return ""
+        return text
+    head, _, partial = text.rpartition("\n")
+    kept: list[str] = []
+    for index, line in enumerate(head.split("\n")):
+        if _is_crawl_line(line) and (at_line_start or index > 0):
+            continue
+        kept.append(line)
+    result = "\n".join(kept)
+    if kept:
+        result += "\n"
+    # The last line has no terminator, but it still begins a line, so a
+    # crawl-status line among them is dropped as well.
+    if partial and not _is_crawl_line(partial):
+        result += partial
+    return result
+
+
+def _find_line_end(text: str) -> tuple[int, int]:
+    """Find the next line terminator in text.
+
+    Only "\n" ends a line here. The other characters ``str.splitlines`` treats
+    as line breaks are not terminators, so the text the client receives keeps
+    them, and a line that starts with a carriage return is still the line it
+    belongs to.
+
+    Args:
+        text: Text to search.
+
+    Returns:
+        tuple[int, int]: Where the terminator starts and how long it is, or
+        (-1, 0) when the text holds no terminator.
+    """
+    newline = text.find("\n")
+    if newline == -1:
+        return -1, 0
+    return newline, 1
 
 
 def tool_message(tool_call: dict[str, Any]) -> dict[str, Any]:
@@ -1194,7 +1402,14 @@ def upload_images(
     """
     if not image_urls:
         return []
-    if model not in vision_model_ids():
+    vision_ids = vision_model_ids()
+    if vision_ids is None:
+        return error_response(
+            "The model catalog is temporarily unavailable.",
+            503,
+            "catalog_unavailable",
+        )
+    if model not in vision_ids:
         return error_response(
             f"This model does not support image inputs: {model}",
             400,
@@ -1250,7 +1465,10 @@ def build_payload(
     model = data.get("model", config.DEFAULT_CHAT_MODEL)
 
     # 19. Enhanced Model Warning Traces
-    if model not in {model_id(m) for m in chat_models() if model_id(m)}:
+    catalog = chat_models()
+    if catalog is not None and model not in {
+        model_id(m) for m in catalog if model_id(m)
+    }:
         logger.warning(
             "Requested model '%s' is not listed in active models catalog.", model
         )
@@ -1345,6 +1563,13 @@ def models() -> tuple[Response, int]:
     Returns:
         tuple[Response, int]: OpenAI-compatible model listing.
     """
+    catalog = chat_models()
+    if catalog is None:
+        return error_response(
+            "The model catalog is temporarily unavailable.",
+            503,
+            "catalog_unavailable",
+        )
     return jsonify(
         {
             "object": "list",
@@ -1355,7 +1580,7 @@ def models() -> tuple[Response, int]:
                     "created": 1727389042,
                     "owned_by": "1minai",
                 }
-                for entry in chat_models()
+                for entry in catalog
                 if model_id(entry)
             ],
         }
@@ -1456,7 +1681,7 @@ def chat_completions() -> tuple[Response, int] | Response:
 
 def stream_response(
     upstream: requests.Response, data: dict[str, Any], model: str
-) -> Generator[str, None, None]:
+) -> _ClosingStream:
     """Stream response back to client with robust tool call buffering protection and standard OpenAI formats.
 
     Args:
@@ -1464,10 +1689,74 @@ def stream_response(
         data: Core user request body.
         model: Target model indicator.
 
-    Yields:
-        Generator[str, None, None]: Server-Sent Event chunk sequences.
+    Returns:
+        _ClosingStream: The event-stream chunks. Closing it closes the upstream
+        response.
     """
+    return _ClosingStream(upstream, _stream_body(upstream, data, model))
+
+
+class _ClosingStream:
+    """Iterator over the event-stream chunks that closes the upstream response.
+
+    Werkzeug closes the iterable it is given when the request ends. A plain
+    generator runs its cleanup only once it has started, so the upstream
+    response is closed here as well: this wrapper closes it even when it is
+    closed before the first chunk has been read.
+    """
+
+    def __init__(
+        self, upstream: requests.Response, chunks: Generator[str, None, None]
+    ) -> None:
+        """Store the upstream response and the chunk iterator.
+
+        Args:
+            upstream: The upstream response to close.
+            chunks: The iterator producing the event-stream chunks.
+        """
+        self._upstream = upstream
+        self._chunks = chunks
+        self._closed = False
+
+    def __iter__(self) -> _ClosingStream:
+        """Return this iterator.
+
+        Returns:
+            _ClosingStream: This iterator.
+        """
+        return self
+
+    def __next__(self) -> str:
+        """Return the next event-stream chunk.
+
+        The upstream response is closed when the stream ends or fails, so the
+        connection is never left open.
+
+        Returns:
+            str: The next chunk.
+        """
+        try:
+            return next(self._chunks)
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        """Close the chunk iterator and the upstream response."""
+        if self._closed:
+            return
+        self._closed = True
+        self._chunks.close()
+        self._upstream.close()
+
+
+def _stream_body(
+    upstream: requests.Response, data: dict[str, Any], model: str
+) -> Generator[str, None, None]:
+    """Yield the event-stream chunks for the upstream response."""
     buffered_text = ""
+    at_line_start = True
+    dropping_line = False
     tail_size = 200
     current_event = None
     stream_id = f"chatcmpl-{uuid.uuid4()}"
@@ -1583,6 +1872,9 @@ def stream_response(
                     call = parse_tool_text(buffered_text, tools)
                     if call:
                         yield from emit_tool_call(call)
+                        # The gateway stops reading the upstream here, so the
+                        # response is released now.
+                        upstream.close()
                         yield "data: [DONE]\n\n"
                         return
                     else:
@@ -1591,18 +1883,64 @@ def stream_response(
                     in_tool_buffering = False
 
             if not in_tool_buffering:
-                if len(buffered_text) > tail_size:
-                    flush = buffered_text[:-tail_size]
-                    if flush:
-                        cleaned = clean_text(flush)
-                        chunk = emit_content_chunk(cleaned)
+                # Emit every complete line. The crawl-status filter only sees
+                # lines that really begin a line: the buffer can start in the
+                # middle of one, and such a fragment is never a crawl-status
+                # line and is never dropped.
+                while True:
+                    index, length = _find_line_end(buffered_text)
+                    if index == -1:
+                        break
+                    line = buffered_text[:index]
+                    terminator = buffered_text[index : index + length]
+                    buffered_text = buffered_text[index + length :]
+                    if dropping_line:
+                        dropping_line = False
+                    elif not (at_line_start and _is_crawl_line(line)):
+                        chunk = emit_content_chunk(line + terminator)
                         if chunk:
                             yield chunk
-                    buffered_text = buffered_text[-tail_size:]
+                    at_line_start = True
 
-    text = clean_text(buffered_text)
-    if text:
-        chunk = emit_content_chunk(text)
+                if dropping_line:
+                    # The crawl-status line continues and its text is dropped.
+                    # The last part of it is kept, so that a tool call on the
+                    # same line is still detected instead of vanishing with the
+                    # line.
+                    if len(buffered_text) > tail_size:
+                        buffered_text = buffered_text[-tail_size:]
+                        at_line_start = False
+                else:
+                    keep = tail_size
+                    if at_line_start:
+                        decision = _crawl_decision(buffered_text)
+                        if decision == "crawl":
+                            # The line is a crawl-status line: drop it.
+                            dropping_line = True
+                            keep = len(buffered_text)
+                        elif decision == "undecided":
+                            # The line may still become a crawl-status line, so
+                            # hold it back. The cap keeps the buffer bounded.
+                            keep = min(len(buffered_text), CRAWL_HOLDBACK_MAX)
+                    if len(buffered_text) > keep:
+                        cut = len(buffered_text) - keep
+                        chunk = emit_content_chunk(buffered_text[:cut])
+                        if chunk:
+                            yield chunk
+                        buffered_text = buffered_text[cut:]
+                        # The cut is inside a line, so the buffer no longer
+                        # starts at a line beginning.
+                        at_line_start = False
+
+    if dropping_line:
+        # The stream ended inside a crawl-status line.
+        buffered_text = ""
+    elif buffered_text:
+        # The buffer can hold more than one line when a tool call was never
+        # finished, so the crawl-status lines among them are dropped here too.
+        buffered_text = _drop_crawl_lines(buffered_text, at_line_start)
+    if buffered_text:
+        chunk = emit_content_chunk(buffered_text)
         if chunk:
             yield chunk
 
@@ -1644,17 +1982,24 @@ def image_generations() -> tuple[Response, int]:
     data = request_json()
     if isinstance(data, tuple):
         return data
+    prompt = data.get("prompt")
+    if not prompt:
+        return error_response("No prompt provided.", 400, "invalid_request_error")
+
     model = data.get("model", config.DEFAULT_IMAGE_MODEL)
-    if model not in image_model_ids():
+    image_ids = image_model_ids()
+    if image_ids is None:
+        return error_response(
+            "The model catalog is temporarily unavailable.",
+            503,
+            "catalog_unavailable",
+        )
+    if model not in image_ids:
         return error_response(
             f"This model does not support image generation: {model}",
             400,
             "model_not_supported",
         )
-
-    prompt = data.get("prompt")
-    if not prompt:
-        return error_response("No prompt provided.", 400, "invalid_request_error")
 
     # Use connection pool session and custom header propagation
     upstream = get_session().post(
