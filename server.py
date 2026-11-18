@@ -47,6 +47,9 @@ from werkzeug.http import HTTP_STATUS_CODES
 from waitress import serve
 
 
+logger = logging.getLogger("one-min-ai-gateway")
+
+
 def _int_setting(name: str, default: int) -> int:
     """Read an integer setting, falling back to its default.
 
@@ -60,9 +63,7 @@ def _int_setting(name: str, default: int) -> int:
     try:
         return int(os.getenv(name, str(default)))
     except ValueError:
-        logging.getLogger("one-min-ai-gateway").warning(
-            "the %s setting is not a number; using %d", name, default
-        )
+        logger.warning("the %s setting is not a number; using %d", name, default)
         return default
 
 
@@ -79,14 +80,10 @@ def _float_setting(name: str, default: float) -> float:
     try:
         value = float(os.getenv(name, str(default)))
     except ValueError:
-        logging.getLogger("one-min-ai-gateway").warning(
-            "the %s setting is not a number; using %s", name, default
-        )
+        logger.warning("the %s setting is not a number; using %s", name, default)
         return default
     if not math.isfinite(value):
-        logging.getLogger("one-min-ai-gateway").warning(
-            "the %s setting is not a finite number; using %s", name, default
-        )
+        logger.warning("the %s setting is not a finite number; using %s", name, default)
         return default
     return value
 
@@ -175,8 +172,6 @@ def asset_api_url() -> str:
 def feature_api_url() -> str:
     return f"{config.ONE_MIN_API_BASE_URL}/api/features"
 
-
-logger = logging.getLogger("one-min-ai-gateway")
 
 # 5. Persistent Connection Pooling
 _session: requests.Session | None = None
@@ -371,6 +366,12 @@ def post_upstream(label: str, url: str, **kwargs: Any) -> requests.Response:
     for attempt in range(config.MAX_UPSTREAM_RETRIES):
         if response.status_code not in RETRY_STATUS_CODES:
             break
+        if not _rewind_files(kwargs):
+            # The file cannot be sent again, so the decline is the answer
+            # rather than an upload with nothing in it. The caller is not held
+            # for a wait it would not use.
+            logger.warning("the %s request is not sent again", label)
+            break
         delay = _retry_delay(attempt, response)
         logger.warning(
             "upstream declined the %s request with status %d; retrying in %.2fs",
@@ -378,12 +379,6 @@ def post_upstream(label: str, url: str, **kwargs: Any) -> requests.Response:
             response.status_code,
             delay,
         )
-        if not _rewind_files(kwargs):
-            # The file cannot be sent again, so the decline is the answer
-            # rather than an upload with nothing in it. The caller is not held
-            # for a wait it would not use.
-            logger.warning("the %s request is not sent again", label)
-            break
         time.sleep(delay)
         try:
             sent_again = get_session().post(url, **kwargs)

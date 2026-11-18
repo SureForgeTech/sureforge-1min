@@ -1,4 +1,5 @@
 import json
+import os
 from io import BytesIO
 from typing import Any, Generator
 import pytest
@@ -1301,3 +1302,80 @@ def test_a_file_in_a_list_is_found():
     assert server._file_stream(value) is stream
     assert server._file_stream([value]) is stream
     assert server._file_stream("just a name") is None
+
+
+def test_the_gateway_starts_with_a_setting_that_cannot_be_read():
+    """The gateway starts when a setting cannot be read, with the default."""
+    import subprocess
+    import sys
+
+    script = (
+        "import server;"
+        "print(server.config.MAX_UPSTREAM_RETRIES,"
+        "server.config.UPSTREAM_RETRY_BACKOFF_SECONDS,"
+        "server.config.UPSTREAM_RETRY_MAX_SECONDS)"
+    )
+    env = dict(os.environ)
+    env.update(
+        {
+            "MAX_UPSTREAM_RETRIES": "not-a-number",
+            "UPSTREAM_RETRY_BACKOFF_SECONDS": "0.25s",
+            "UPSTREAM_RETRY_MAX_SECONDS": "",
+            "PYTHONPATH": os.path.dirname(
+                os.path.dirname(os.path.abspath(server.__file__))
+            ),
+        }
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, env=env
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("2 0.25 5")
+
+
+def test_a_setting_that_is_not_a_finite_number_falls_back_to_the_default(
+    monkeypatch, caplog
+):
+    """A setting that is not a finite number falls back to its default."""
+    import logging
+
+    monkeypatch.setenv("A_SETTING_THAT_IS_NAN", "nan")
+    monkeypatch.setenv("A_SETTING_THAT_IS_INFINITE", "inf")
+    with caplog.at_level(logging.WARNING, logger="one-min-ai-gateway"):
+        assert server._float_setting("A_SETTING_THAT_IS_NOT_A_NUMBER", 5) == 5
+        assert server._float_setting("A_SETTING_THAT_IS_NAN", 5) == 5
+        assert server._float_setting("A_SETTING_THAT_IS_INFINITE", 5) == 5
+
+    assert (
+        len([r for r in caplog.records if "not a finite number" in r.getMessage()]) == 2
+    )
+
+
+def test_a_file_whose_seek_cannot_be_called_is_not_sent_again(monkeypatch):
+    """A file whose seek cannot be called is not sent again."""
+    calls = []
+
+    class BrokenFile:
+        def __init__(self) -> None:
+            self.seek = "not callable"  # type: ignore[assignment]
+
+        def read(self) -> bytes:
+            return b"payload"
+
+    class Session:
+        def post(self, *args: Any, **kwargs: Any) -> FakeHTTPResponse:
+            calls.append(1)
+            return FakeHTTPResponse(status_code=503, text="busy")
+
+    monkeypatch.setattr(server, "get_session", lambda: Session())
+    monkeypatch.setattr(server.time, "sleep", lambda seconds: None)
+
+    response = server.post_upstream(
+        "asset",
+        "https://example.invalid/assets",
+        files={"asset": ("a.bin", BrokenFile(), "application/octet-stream")},
+    )
+
+    assert response.status_code == 503
+    assert len(calls) == 1
