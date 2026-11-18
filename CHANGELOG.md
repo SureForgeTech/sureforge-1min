@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- [SECURITY] Request bodies are bounded: a body larger than `MAX_REQUEST_BYTES` (32 MB by default) is refused with `413`, instead of being held in memory, and an inline base64 image over the image limit is refused; a payload far over the limit is refused before it is decoded at all. The budget is for the whole request, so the inline images of a request share it: two images of the image limit fit, three do not. A body of one megabyte more than the limit is refused by the server in front, with a plain-text `413`.
+
 - [FIX] The image endpoint checks the request before the catalogue, so a request without a prompt is refused as such even while the catalogue is unavailable.
 - [FIX] A failing model catalog no longer empties the model list for the whole cache lifetime: the last catalog that was fetched is served while the upstream is down, a failure is not cached as an empty catalog (a catalog that holds no models is, but one whose entries the gateway cannot read is a failure), one feature is fetched at a time instead of all of them behind one lock, and the model list, the image endpoint and the image path of the chat endpoint report an unavailable catalog (503) instead of blaming the caller's model choice (400 `model_not_supported`). How long a failed fetch is remembered is set by `CATALOG_RETRY_SECONDS`.
 

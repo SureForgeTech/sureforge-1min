@@ -38,7 +38,7 @@ from flask import (
     g,
     has_request_context,
 )
-from werkzeug.exceptions import BadRequest, HTTPException
+from werkzeug.exceptions import HTTPException, RequestEntityTooLarge
 from werkzeug.http import HTTP_STATUS_CODES
 from waitress import serve
 
@@ -63,6 +63,9 @@ class GatewayConfig:
     CATALOG_TTL_SECONDS: int = int(os.getenv("CATALOG_TTL_SECONDS", "300"))
     CATALOG_RETRY_SECONDS: int = int(os.getenv("CATALOG_RETRY_SECONDS", "10"))
     MAX_IMAGE_BYTES: int = int(os.getenv("MAX_IMAGE_BYTES", str(10 * 1024 * 1024)))
+    # The budget for a whole request. It holds the inline images of a request
+    # together: two images of the image limit need about 27 MB.
+    MAX_REQUEST_BYTES: int = int(os.getenv("MAX_REQUEST_BYTES", str(32 * 1024 * 1024)))
     CORS_ALLOW_ORIGIN: str = os.getenv("CORS_ALLOW_ORIGIN", "*")
     PORT: int = 5001
     HOST: str = os.getenv("HOST", "0.0.0.0")
@@ -529,15 +532,34 @@ def request_json() -> dict[str, Any] | tuple[Response, int]:
         dict[str, Any] | tuple[Response, int]: Parsed JSON dict or Flask error response.
     """
     # 12. Improved Empty Request Body Parsing
-    if not request.data:
+    limit = config.MAX_REQUEST_BYTES
+    # A body that declares its length is refused before it is read.
+    if request.content_length is not None and request.content_length > limit:
+        return error_response(
+            f"The request body is larger than {limit} bytes.",
+            413,
+            "request_too_large",
+        )
+    # The body is read from the raw input with a limit of its own. The
+    # framework does not limit a body whose length is not declared, so the
+    # excess would go unnoticed without it.
+    raw = request.environ.get("wsgi.input")
+    body = raw.read(limit + 1) if raw is not None else b""
+    if len(body) > limit:
+        return error_response(
+            f"The request body is larger than {limit} bytes.",
+            413,
+            "request_too_large",
+        )
+    if not body:
         return error_response(
             "Empty request body. Please provide a valid JSON object.",
             400,
             "empty_request_body",
         )
     try:
-        data = request.get_json(force=True)
-    except BadRequest:
+        data = json.loads(body)
+    except ValueError:
         return error_response("Invalid JSON body.", 400, "invalid_json")
     if not isinstance(data, dict):
         return error_response(
@@ -1297,6 +1319,13 @@ def decode_data_image(image_url: str) -> BytesIO | tuple[Response, int]:
         encoded = image_url.split(",", 1)[1]
     except IndexError:
         return error_response("Invalid image data URL.", 400, "invalid_image")
+    # The encoded text is measured before it is decoded, so a payload that is
+    # far over the limit is never turned into bytes in memory. The bound is
+    # the longest text a payload of the limit can have, rounded up to a whole
+    # quantum, because a payload of one or two bytes more can have the same
+    # text length.
+    if len(encoded) > 4 * ((config.MAX_IMAGE_BYTES + 4) // 3):
+        return error_response("Image payload is too large.", 413, "image_too_large")
     try:
         payload = base64.b64decode(encoded, validate=True)
     except (binascii.Error, ValueError):
@@ -2018,6 +2047,11 @@ def create_app() -> Flask:
     """
     app = Flask(__name__)
     app.url_map.strict_slashes = False
+    # A backstop for anything that reads the body through the framework. The
+    # application reads the raw input with a limit of its own, so that a body
+    # which declares no length is refused as well. The handler below answers
+    # with the OpenAI error shape when the framework trips this limit.
+    app.config["MAX_CONTENT_LENGTH"] = config.MAX_REQUEST_BYTES
 
     # 11. Relocate global logging initialization inside create_app
     configure_logging()
@@ -2060,6 +2094,25 @@ def create_app() -> Flask:
         return response
 
     # 5. Global Exception JSON Error Handler
+    @app.errorhandler(RequestEntityTooLarge)
+    def handle_request_too_large(exc: RequestEntityTooLarge) -> tuple[Response, int]:
+        """Answer a request body that is larger than the gateway accepts.
+
+        Args:
+            exc: The exception raised by the request parser.
+
+        Returns:
+            tuple[Response, int]: The OpenAI-shaped error response.
+        """
+        logger.warning(
+            "rejected a request body larger than %d bytes", config.MAX_REQUEST_BYTES
+        )
+        return error_response(
+            f"The request body is larger than {config.MAX_REQUEST_BYTES} bytes.",
+            413,
+            "request_too_large",
+        )
+
     @app.errorhandler(Exception)
     def handle_exception(exc: Exception) -> tuple[Response, int]:
         logger.exception("Unhandled error occurred in gateway: %s", exc)
@@ -2086,7 +2139,16 @@ def main() -> None:
     logger.info(
         "one-min-ai-gateway starting on %s:%s via CLI", config.HOST, config.PORT
     )
-    serve(app, host=config.HOST, port=config.PORT, threads=config.WAITRESS_THREADS)
+    serve(
+        app,
+        host=config.HOST,
+        port=config.PORT,
+        threads=config.WAITRESS_THREADS,
+        # The limit of the server in front is a little larger than the limit of
+        # the application, so that the application refuses the body and the
+        # answer carries the OpenAI error shape.
+        max_request_body_size=config.MAX_REQUEST_BYTES + 1024 * 1024,
+    )
 
 
 if __name__ == "__main__":

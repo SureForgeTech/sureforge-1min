@@ -37,6 +37,7 @@ Useful environment variables:
 - `CATALOG_RETRY_SECONDS`: how long a failed model catalog fetch is remembered before the upstream is asked again, default `10`; a value of zero or less means one second
 - When the model catalog cannot be fetched and no earlier copy was kept, `/v1/models`, `/v1/images/generations` and the image path of `/v1/chat/completions` answer `503` with the code `catalog_unavailable`. A catalogue the gateway cannot read -- one whose entries are not objects, or that carry no identifier -- is a failure too, so the last catalogue that was read is served instead
 - `MAX_IMAGE_BYTES`: maximum image upload/fetch payload in bytes, default `10485760` (10 MB)
+- `MAX_REQUEST_BYTES`: the budget for a whole request in bytes, default `33554432` (32 MB); a larger body is refused with `413`. The budget holds the inline images of a request together: two images of the image limit need about 27 MB and fit, three need about 40 MB and are refused. A body of one megabyte more than the budget is refused by the server in front of the gateway, with a plain-text `413`, because it cannot answer with the error shape of the gateway. A body at the budget is held about four times over while it is read, parsed and forwarded, so with the default eight workers a busy gateway can hold around a gigabyte of bodies
 - `CORS_ALLOW_ORIGIN`: CORS origin value, default `*`
 - `DEFAULT_CHAT_MODEL`: default fallback chat model, default `gpt-4o`
 - `DEFAULT_IMAGE_MODEL`: default fallback image generator model, default `black-forest-labs/flux-schnell`
