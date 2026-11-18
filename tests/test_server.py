@@ -1038,3 +1038,65 @@ def test_stream_response_closes_upstream_when_consumer_stops():
     next(stream)
     stream.close()
     assert upstream.closed is True
+
+
+def test_a_crawl_status_line_in_an_unfinished_tool_call_is_dropped():
+    """A tool call that never ends does not let a status line through."""
+    text = "<tool_call\nbefore\n\U0001f310 Crawling site https://x\nafter\n"
+
+    class FakeResponse:
+        def iter_lines(self, decode_unicode=False):
+            return [f"data: {json.dumps({'delta': {'content': text}})}".encode("utf-8")]
+
+        def close(self):
+            pass
+
+    received = _streamed_content(server.stream_response(FakeResponse(), {}, "m"))
+
+    assert "Crawling" not in received
+    assert "before" in received
+    assert "after" in received
+
+
+def test_a_long_crawl_status_line_is_dropped_whole():
+    """A crawl-status line that is longer than a short one is still dropped."""
+    line = "\U0001f310 Crawling site " + " " * 5000 + "https://x\n"
+
+    class FakeResponse:
+        def iter_lines(self, decode_unicode=False):
+            return [
+                f"data: {json.dumps({'delta': {'content': line[i : i + 200]}})}".encode(
+                    "utf-8"
+                )
+                for i in range(0, len(line), 200)
+            ]
+
+        def close(self):
+            pass
+
+    received = _streamed_content(server.stream_response(FakeResponse(), {}, "m"))
+
+    assert "Crawling" not in received
+    assert "uuuu" not in received
+
+
+def test_a_crawl_status_line_after_a_long_run_of_spaces_is_dropped():
+    """A status line that follows a long run of spaces is still dropped."""
+    line = " " * 4100 + "\U0001f310 Crawling site hidden\n"
+
+    class FakeResponse:
+        def iter_lines(self, decode_unicode=False):
+            return [
+                f"data: {json.dumps({'delta': {'content': line[i : i + 137]}})}".encode(
+                    "utf-8"
+                )
+                for i in range(0, len(line), 137)
+            ]
+
+        def close(self):
+            pass
+
+    received = _streamed_content(server.stream_response(FakeResponse(), {}, "m"))
+
+    assert "Crawling" not in received
+    assert "hidden" not in received

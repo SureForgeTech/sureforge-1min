@@ -623,9 +623,9 @@ CRAWL_MARKER = "🌐 Crawling site "
 
 # The most text held back while it is still undecided whether the current line
 # is a crawl-status line. The holdback is what lets the filter see the marker
-# after any leading space, so it is generous; a crawl-status line with more
-# leading space than this is let through rather than held.
-CRAWL_HOLDBACK_MAX = 4096
+# after any leading space, so it is generous; a crawl-status line that is
+# longer than this is let through rather than held.
+CRAWL_HOLDBACK_MAX = 8192
 
 
 def clean_text(text: str) -> str:
@@ -684,6 +684,36 @@ def _crawl_decision(text: str) -> str:
     if CRAWL_MARKER.startswith(stripped):
         return "undecided"
     return "clear"
+
+
+def _drop_crawl_lines(text: str, at_line_start: bool) -> str:
+    """Drop the crawl-status lines among the complete lines of a text.
+
+    The text may hold more than one line, which happens when a tool call was
+    never finished and the line splitting was skipped. The first line is only
+    a crawl-status line when it really begins a line.
+
+    Args:
+        text: Text that holds complete lines and a trailing partial line.
+        at_line_start: Whether the first line of the text begins a line.
+
+    Returns:
+        str: The text without its crawl-status lines.
+    """
+    if "\n" not in text:
+        if at_line_start and _is_crawl_line(text):
+            return ""
+        return text
+    head, _, partial = text.rpartition("\n")
+    kept: list[str] = []
+    for index, line in enumerate(head.split("\n")):
+        if _is_crawl_line(line) and (at_line_start or index > 0):
+            continue
+        kept.append(line)
+    result = "\n".join(kept)
+    if kept:
+        result += "\n"
+    return result + partial
 
 
 def _find_line_end(text: str) -> tuple[int, int]:
@@ -1752,8 +1782,10 @@ def _stream_body(
     if dropping_line:
         # The stream ended inside a crawl-status line.
         buffered_text = ""
-    elif buffered_text and at_line_start and _is_crawl_line(buffered_text):
-        buffered_text = ""
+    elif buffered_text:
+        # The buffer can hold more than one line when a tool call was never
+        # finished, so the crawl-status lines among them are dropped here too.
+        buffered_text = _drop_crawl_lines(buffered_text, at_line_start)
     if buffered_text:
         chunk = emit_content_chunk(buffered_text)
         if chunk:
