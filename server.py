@@ -477,9 +477,10 @@ class _CatalogState:
     failing upstream does not empty the catalog. The copy is None until one was
     fetched; a catalog that was fetched and holds no models is kept as an empty
     tuple, so that an upstream that answers without models is not asked again
-    for every request. A response whose shape the gateway does not know, or
-    whose entries it cannot read, is a failure, so it never replaces a good
-    copy. The failure is remembered for a
+    for every request. A response whose shape the gateway does not know, or one
+    whose entries it cannot read at all, is a failure, so it never replaces a
+    good copy. An entry that cannot be read on its own is left out of the
+    catalogue. The failure is remembered for a
     short while, so that a burst of requests does not hammer the upstream. The
     copy is served for as long as the upstream is down, which is the trade-off
     of keeping it.
@@ -538,12 +539,15 @@ def _request_catalog(feature: str) -> tuple[dict[str, Any], ...]:
         raise ValueError(
             "the model catalog response holds an entry the gateway cannot read"
         )
-    for entry in entries:
-        if not model_id(entry):
-            raise ValueError(
-                "the model catalog response holds an entry without an identifier"
-            )
-    return entries
+    readable = tuple(entry for entry in entries if model_id(entry))
+    if entries and not readable:
+        # Not one entry carries an identifier the gateway knows, so the
+        # catalogue is not one it can read. That is a failure, not an empty
+        # catalogue: the last good one is kept.
+        raise ValueError(
+            "the model catalog response holds no entry the gateway can read"
+        )
+    return readable
 
 
 def _catalog_retry() -> float:
@@ -655,6 +659,14 @@ def chat_models() -> list[dict[str, Any]] | None:
     return fetch_catalog("UNIFY_CHAT_WITH_AI")
 
 
+# The names an entry of the model catalogue may carry its identifier under.
+# The upstream is the only one that knows which of them it uses, so the first
+# one that holds a value is taken. A display name is not one of them: a model
+# the caller asked for must not be looked for under a name the upstream gave
+# it for display.
+CATALOG_ID_KEYS = ("id", "modelId", "model")
+
+
 def model_id(entry: dict[str, Any]) -> str:
     """Safely extract model ID from a catalog entry.
 
@@ -662,13 +674,15 @@ def model_id(entry: dict[str, Any]) -> str:
         entry: The catalog model entry.
 
     Returns:
-        str: The identified model ID.
+        str: The identified model ID, or an empty string when the entry
+        carries none of the names the identifier may be under.
     """
-    val = entry.get("id") or entry.get("modelId")
-    if not val:
-        logger.warning("Catalog model entry lacks a valid identifier: %s", entry)
-        return ""
-    return str(val)
+    for key in CATALOG_ID_KEYS:
+        val = entry.get(key)
+        if val:
+            return str(val)
+    logger.warning("Catalog model entry lacks a valid identifier: %s", entry)
+    return ""
 
 
 # 7. Vision and Image Model ID Sets Cache Optimization (frozenset)
