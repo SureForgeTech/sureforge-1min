@@ -1743,7 +1743,7 @@ def extract_result_text(data: dict[str, Any]) -> str | None:
 # the ideographs, the kana and the hangul syllables. A run of them is counted
 # one by one, because a word of them is not one token.
 _CJK_CHARACTERS = (
-    "\u2e80-\u2eff"  # CJK radicals and kangxi radicals
+    "\u2e80-\u2fdf"  # CJK radicals and kangxi radicals
     "\u3005-\u3007"  # the iteration mark and the ideographic zero
     "\u3040-\u309f"  # hiragana
     "\u30a0-\u30ff"  # katakana
@@ -1764,7 +1764,7 @@ _CJK_CHARACTERS = (
 # because that is how a tokeniser of a model provider splits them.
 _TOKEN_PIECE = re.compile(
     "[" + _CJK_CHARACTERS + "]"  # a character a tokeniser gives a token of its own
-    "|[0-9]{1,3}"  # a group of digits
+    r"|\d{1,3}"  # a group of digits
     "|[^\\W\\d" + _CJK_CHARACTERS + "]+"  # a word
     "|[^\\w\\s]"  # a mark of punctuation
 )

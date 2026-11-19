@@ -2714,6 +2714,17 @@ def test_the_token_count_counts_the_digits_in_groups_of_three():
     assert server.token_count("a 123 b") == 3
 
 
+def test_the_token_count_counts_the_digits_of_every_script():
+    """The digits of another script are counted as well."""
+    assert server.token_count("２０２４") == 2
+    assert server.token_count("١٢٣٤") == 2
+    assert server.token_count("2024") == 2
+    # A date written with the fullwidth digits counts like the same date.
+    assert server.token_count("２０２４年１２月５日") == server.token_count(
+        "2024年12月5日"
+    )
+
+
 def test_the_token_count_of_a_mixed_text_counts_both_writings():
     """A text that mixes the writings counts each of them its own way."""
     assert server.token_count("Hello 世界, 123 items!") == 7
