@@ -2290,6 +2290,9 @@ def test_the_identifier_of_an_entry_is_read_from_any_of_its_names():
     assert server.model_id({"modelId": "gpt-4o"}) == "gpt-4o"
     assert server.model_id({"model": "gpt-4o"}) == "gpt-4o"
     assert server.model_id({"colour": "blue"}) == ""
+    # The first name that holds a value is the one that is taken.
+    assert server.model_id({"id": "a", "modelId": "b", "model": "c"}) == "a"
+    assert server.model_id({"modelId": "b", "model": "c"}) == "b"
 
 
 def test_a_display_name_is_not_read_as_an_identifier():

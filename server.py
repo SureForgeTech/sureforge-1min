@@ -480,10 +480,9 @@ class _CatalogState:
     for every request. A response whose shape the gateway does not know, or one
     whose entries it cannot read at all, is a failure, so it never replaces a
     good copy. An entry that cannot be read on its own is left out of the
-    catalogue. The failure is remembered for a
-    short while, so that a burst of requests does not hammer the upstream. The
-    copy is served for as long as the upstream is down, which is the trade-off
-    of keeping it.
+    catalogue. The failure is remembered for a short while, so that a burst of
+    requests does not hammer the upstream. The copy is served for as long as
+    the upstream is down, which is the trade-off of keeping it.
     """
 
     entries: tuple[dict[str, Any], ...] | None = None
