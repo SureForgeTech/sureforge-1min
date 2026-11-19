@@ -2247,7 +2247,7 @@ def test_a_caller_after_a_failure_does_not_wait_for_a_running_fetch(monkeypatch)
         quick.join(5)
 
 
-def test_a_catalog_with_entries_the_gateway_cannot_read_is_a_failure(monkeypatch):
+def test_a_catalog_the_gateway_cannot_read_at_all_is_a_failure(monkeypatch):
     """A catalogue whose entries cannot be read never replaces a good one."""
     session = FakeCatalogSession([{"id": "gpt-4o"}])
     monkeypatch.setattr(server, "get_session", lambda: session)
@@ -2260,7 +2260,7 @@ def test_a_catalog_with_entries_the_gateway_cannot_read_is_a_failure(monkeypatch
 
         def get(self, *args: Any, **kwargs: Any) -> FakeHTTPResponse:
             self.calls += 1
-            return FakeHTTPResponse(text=json.dumps({"models": [{"name": "gpt-4o"}]}))
+            return FakeHTTPResponse(text=json.dumps({"models": [{"name": "GPT-4o"}]}))
 
     monkeypatch.setattr(server, "get_session", lambda: UnreadableSession())
     state = server._catalog_state("IMAGE_GENERATOR")
@@ -2269,6 +2269,44 @@ def test_a_catalog_with_entries_the_gateway_cannot_read_is_a_failure(monkeypatch
 
     # The good copy is still served.
     assert server.fetch_catalog("IMAGE_GENERATOR") == [{"id": "gpt-4o"}]
+
+
+def test_an_entry_the_gateway_cannot_read_is_left_out_of_the_catalogue(monkeypatch):
+    """One entry that cannot be read does not take the whole catalogue down."""
+    session = FakeCatalogSession(
+        [{"id": "gpt-4o"}, {"colour": "blue"}, {"id": "flux-schnell"}]
+    )
+    monkeypatch.setattr(server, "get_session", lambda: session)
+
+    assert server.fetch_catalog("IMAGE_GENERATOR") == [
+        {"id": "gpt-4o"},
+        {"id": "flux-schnell"},
+    ]
+
+
+def test_the_identifier_of_an_entry_is_read_from_any_of_its_names():
+    """The identifier is read from the name the upstream gives it."""
+    assert server.model_id({"id": "gpt-4o"}) == "gpt-4o"
+    assert server.model_id({"modelId": "gpt-4o"}) == "gpt-4o"
+    assert server.model_id({"model": "gpt-4o"}) == "gpt-4o"
+    assert server.model_id({"colour": "blue"}) == ""
+    # The first name that holds a value is the one that is taken.
+    assert server.model_id({"id": "a", "modelId": "b", "model": "c"}) == "a"
+    assert server.model_id({"modelId": "b", "model": "c"}) == "b"
+
+
+def test_a_display_name_is_not_read_as_an_identifier():
+    """A name the upstream gave a model for display is not its identifier."""
+    assert server.model_id({"name": "GPT-4o"}) == ""
+
+
+def test_a_catalogue_whose_entries_name_the_model_in_another_way_is_read(monkeypatch):
+    """A catalogue that names the model in another way is still read."""
+    session = FakeCatalogSession([{"model": "gpt-4o"}])
+    monkeypatch.setattr(server, "get_session", lambda: session)
+
+    assert server.fetch_catalog("IMAGE_GENERATOR") == [{"model": "gpt-4o"}]
+    assert server.image_model_ids() == frozenset({"gpt-4o"})
 
 
 def test_a_caller_without_a_copy_waits_for_the_running_fetch(monkeypatch):
