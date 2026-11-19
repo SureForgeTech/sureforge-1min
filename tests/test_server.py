@@ -2714,12 +2714,24 @@ def test_the_token_count_counts_the_digits_in_groups_of_three():
     assert server.token_count("a 123 b") == 3
 
 
-def test_the_token_count_gives_the_radicals_of_the_chinese_writing_a_token():
-    """A radical of the Chinese writing is a token of its own."""
-    # A radical next to a word is counted apart from the word.
+def test_the_token_count_counts_a_radical_apart_from_a_word():
+    """A radical of the Chinese writing is counted apart from a word."""
+    # A radical is a mark rather than a word character, and is counted one by
+    # one all the same.
     assert server.token_count("\u2e80abc") == 2
     assert server.token_count("\u2f00abc") == 2
     assert server.token_count("\u4e00abc") == 2
+    assert server.token_count("\u2e80\u4e00") == 2
+
+
+def test_the_token_count_gives_the_jamo_and_the_later_ideographs_a_token():
+    """The jamo and the ideographs of the later extensions are tokens."""
+    assert server.token_count("\u1100\u1101\u1102") == 3
+    assert server.token_count("\ua960\ua961") == 2
+    assert server.token_count("\ud7b0\ud7b1") == 2
+    assert server.token_count("\U0001b000\U0001b001") == 2
+    assert server.token_count("\U00030000\U00030001") == 2
+    assert server.token_count("\U00031350\U00031351") == 2
 
 
 def test_the_token_count_counts_the_digits_of_every_script():

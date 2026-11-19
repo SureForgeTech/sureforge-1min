@@ -1740,24 +1740,30 @@ def extract_result_text(data: dict[str, Any]) -> str | None:
 
 
 # The characters a tokeniser of a model provider gives a token of their own:
-# the ideographs, the kana and the hangul syllables. A run of them is counted
-# one by one, because a word of them is not one token.
+# the word characters of the Chinese, Japanese and Korean writing. A run of
+# them is counted one by one, because a word of them is not one token. The
+# marks of those writings -- the radicals, the strokes -- are not word
+# characters and are counted one by one anyway, so they are not listed here.
 _CJK_CHARACTERS = (
-    "\u2e80-\u2fdf"  # CJK radicals and kangxi radicals
+    "\u1100-\u11ff"  # hangul jamo
     "\u3005-\u3007"  # the iteration mark and the ideographic zero
     "\u3040-\u309f"  # hiragana
     "\u30a0-\u30ff"  # katakana
     "\u3105-\u312f"  # bopomofo
     "\u3130-\u318f"  # hangul compatibility jamo
     "\u31a0-\u31bf"  # bopomofo extensions
-    "\u31c0-\u31ef"  # CJK strokes
     "\u31f0-\u31ff"  # katakana phonetic extensions
     "\u3400-\u4dbf"  # CJK unified ideographs extension A
     "\u4e00-\u9fff"  # CJK unified ideographs
+    "\ua960-\ua97f"  # hangul jamo extended A
     "\uac00-\ud7af"  # hangul syllables
+    "\ud7b0-\ud7ff"  # hangul jamo extended B
     "\uf900-\ufaff"  # CJK compatibility ideographs
     "\uff66-\uff9f"  # halfwidth katakana
-    "\U00020000-\U0002ffff"  # CJK unified ideographs extension B and later
+    "\U0001aff0-\U0001afff"  # kana extended B
+    "\U0001b000-\U0001b0ff"  # kana supplement
+    "\U0001b100-\U0001b12f"  # kana extended A
+    "\U00020000-\U000323af"  # CJK unified ideographs extension B and later
 )
 # The pieces a token is made of: a character of its own, a group of digits, a
 # word, or a mark of punctuation. The digits are counted in groups of three,
@@ -1903,7 +1909,9 @@ class _TokenCounter:
     A word that was cut in half by the end of a piece is counted with the next
     piece, so the count does not depend on where the text was split. The same
     holds for a run of digits and for a run of characters of the Chinese,
-    Japanese or Korean writing.
+    Japanese or Korean writing, as long as the run is no longer than
+    ``MAX_TOKEN_LENGTH``; a longer one is counted as it is, so that the buffer
+    stays bounded.
     """
 
     def __init__(self) -> None:
