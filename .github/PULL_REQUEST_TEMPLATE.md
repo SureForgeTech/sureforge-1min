@@ -52,8 +52,8 @@ Closes #__ISSUE__
 
 ## Changelog entry
 
-<!-- Add one line under `## Unreleased` in `CHANGELOG.md` with one of these
-     labels, OR apply the `changelog-skip` label to this PR for a no-impact
+<!-- Add a note file `changelog.d/<slug>.md` (see changelog.d/README.md) with a
+     line tagged with one of these labels, OR apply the `changelog-skip` label to this PR for a no-impact
      change (e.g., comment typo).
 
        [BREAKING]  -> [major]   incompatible API, data, or operator change
@@ -63,4 +63,4 @@ Closes #__ISSUE__
        [SECURITY]  -> [patch]   vulnerability fix or hardening
 -->
 
-- [LABEL] one-line description matching the line added to CHANGELOG.md
+- [LABEL] one-line description matching the line in your changelog.d note
