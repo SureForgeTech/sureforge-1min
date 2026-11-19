@@ -2714,6 +2714,14 @@ def test_the_token_count_counts_the_digits_in_groups_of_three():
     assert server.token_count("a 123 b") == 3
 
 
+def test_the_token_count_gives_the_radicals_of_the_chinese_writing_a_token():
+    """A radical of the Chinese writing is a token of its own."""
+    # A radical next to a word is counted apart from the word.
+    assert server.token_count("\u2e80abc") == 2
+    assert server.token_count("\u2f00abc") == 2
+    assert server.token_count("\u4e00abc") == 2
+
+
 def test_the_token_count_counts_the_digits_of_every_script():
     """The digits of another script are counted as well."""
     assert server.token_count("２０２４") == 2
