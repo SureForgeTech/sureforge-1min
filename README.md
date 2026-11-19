@@ -98,8 +98,9 @@ Store the credential with OpenCode or pass it as the client API key.
 The token counts the gateway reports in `usage` are an estimate, not the count
 of a model provider's tokeniser. The estimate needs no model file and no
 network, so it is the same in every deployment: a word is a token, a run of
-digits is counted in groups of three, a mark of punctuation is a token, and a
-character of the Chinese, Japanese or Korean writing is a token of its own.
+digits is counted in groups of up to three, a mark of punctuation is a token,
+and a character of the Chinese, Japanese or Korean writing is counted on its
+own.
 
 The estimate was measured on 2026-11-18 against the `cl100k_base` tokeniser,
 built offline from the vocabulary of the `tiktoken-offline` wheel, over the
