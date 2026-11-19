@@ -1,0 +1,1 @@
+- [INTERNAL] Adopt the fleet changelog notes tool: changelog entries are now one file per change in `changelog.d/` instead of lines under `## Unreleased`, which conflicted whenever two pull requests merged close together.

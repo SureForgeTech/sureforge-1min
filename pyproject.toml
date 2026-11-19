@@ -44,6 +44,10 @@ warn_unused_ignores = true
 disable_error_code = ["import-untyped"]
 exclude = ["tests/"]
 
+[tool.ruff]
+# scripts/changelog.py is a vendored byte-identical copy of the fleet tool; do not reformat it.
+extend-exclude = ["scripts/changelog.py"]
+
 [tool.ruff.lint]
 # Keep the rule set that ruff applied by default through 0.15 (ruff 0.17 reports more by
 # default). Adopting the wider set means fixing the findings it reports, which is a separate change.
