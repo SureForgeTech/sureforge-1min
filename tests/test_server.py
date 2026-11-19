@@ -2699,6 +2699,36 @@ def test_the_token_count_does_not_depend_on_where_the_text_was_split():
     assert whole.total() == split.total()
 
 
+def test_the_token_count_gives_a_character_of_the_chinese_writing_its_own_token():
+    """A character of the Chinese writing is a token of its own."""
+    assert server.token_count("你好") == 2
+    assert server.token_count("你好，世界") == 5
+    assert server.token_count("こんにちは") == 5
+    assert server.token_count("안녕하세요") == 5
+
+
+def test_the_token_count_counts_the_digits_in_groups_of_three():
+    """A run of digits is counted in groups of three, as a tokeniser does."""
+    assert server.token_count("42") == 1
+    assert server.token_count("1234567890") == 4
+    assert server.token_count("a 123 b") == 3
+
+
+def test_the_token_count_of_a_mixed_text_counts_both_writings():
+    """A text that mixes the writings counts each of them its own way."""
+    assert server.token_count("Hello 世界, 123 items!") == 7
+
+
+def test_the_token_count_does_not_depend_on_where_a_foreign_text_was_split():
+    """The count of a foreign text does not depend on where it was split."""
+    text = "你好，世界！123 items, 안녕하세요"
+    for cut in range(len(text) + 1):
+        counter = server._TokenCounter()
+        counter.add(text[:cut])
+        counter.add(text[cut:])
+        assert counter.total() == server.token_count(text), cut
+
+
 def test_the_usage_wrapper_closes_the_chunks_it_wraps():
     """The chunks are closed with the wrapper, so the upstream is released."""
     closed = []

@@ -1739,8 +1739,35 @@ def extract_result_text(data: dict[str, Any]) -> str | None:
     return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
 
 
-# The pieces a token is made of: a word, a number, or a mark of punctuation.
-_TOKEN_PIECE = re.compile(r"\w+|[^\w\s]")
+# The characters a tokeniser of a model provider gives a token of their own:
+# the ideographs, the kana and the hangul syllables. A run of them is counted
+# one by one, because a word of them is not one token.
+_CJK_CHARACTERS = (
+    "\u2e80-\u2eff"  # CJK radicals and kangxi radicals
+    "\u3005-\u3007"  # the iteration mark and the ideographic zero
+    "\u3040-\u309f"  # hiragana
+    "\u30a0-\u30ff"  # katakana
+    "\u3105-\u312f"  # bopomofo
+    "\u3130-\u318f"  # hangul compatibility jamo
+    "\u31a0-\u31bf"  # bopomofo extensions
+    "\u31c0-\u31ef"  # CJK strokes
+    "\u31f0-\u31ff"  # katakana phonetic extensions
+    "\u3400-\u4dbf"  # CJK unified ideographs extension A
+    "\u4e00-\u9fff"  # CJK unified ideographs
+    "\uac00-\ud7af"  # hangul syllables
+    "\uf900-\ufaff"  # CJK compatibility ideographs
+    "\uff66-\uff9f"  # halfwidth katakana
+    "\U00020000-\U0002ffff"  # CJK unified ideographs extension B and later
+)
+# The pieces a token is made of: a character of its own, a group of digits, a
+# word, or a mark of punctuation. The digits are counted in groups of three,
+# because that is how a tokeniser of a model provider splits them.
+_TOKEN_PIECE = re.compile(
+    "[" + _CJK_CHARACTERS + "]"  # a character a tokeniser gives a token of its own
+    "|[0-9]{1,3}"  # a group of digits
+    "|[^\\W\\d" + _CJK_CHARACTERS + "]+"  # a word
+    "|[^\\w\\s]"  # a mark of punctuation
+)
 # The longest piece that is carried from one piece of text to the next. A
 # longer one is counted as it is, so that the buffer stays bounded. It is far
 # longer than any word a model writes.
@@ -1854,9 +1881,11 @@ def _chunk_parts(chunk: str) -> tuple[str, str, str, int]:
 def token_count(text: str) -> int:
     """Count the tokens of a text.
 
-    A word, a number and a mark of punctuation are each one token, which is
-    close to what the tokenisers of the model providers produce. The count
-    needs no model file and no network, so it is the same in every
+    A word, a group of up to three digits and a mark of punctuation are each
+    one token, and a character of the Chinese, Japanese or Korean writing is
+    a token of its own, because a tokeniser of a model provider gives one to
+    each of them. This is close to what those tokenisers produce, without
+    needing a model file or a network, so the count is the same in every
     deployment.
 
     Args:
@@ -1872,7 +1901,9 @@ class _TokenCounter:
     """Count the tokens of a text that arrives in pieces.
 
     A word that was cut in half by the end of a piece is counted with the next
-    piece, so the count does not depend on where the text was split.
+    piece, so the count does not depend on where the text was split. The same
+    holds for a run of digits and for a run of characters of the Chinese,
+    Japanese or Korean writing.
     """
 
     def __init__(self) -> None:
