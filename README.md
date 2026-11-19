@@ -93,6 +93,35 @@ Store the credential with OpenCode or pass it as the client API key.
 - `POST /v1/chat/completions`
 - `POST /v1/images/generations`
 
+## Token counts
+
+The token counts the gateway reports in `usage` are an estimate, not the count
+of a model provider's tokeniser. The estimate needs no model file and no
+network, so it is the same in every deployment: a word is a token, a run of
+digits is counted in groups of up to three, a mark of punctuation is a token,
+and a character of the Chinese, Japanese or Korean writing is counted on its
+own.
+
+The estimate was measured on 2026-11-18 against the `cl100k_base` tokeniser,
+built offline from the vocabulary of the `tiktoken-offline` wheel, over the
+samples below. The table gives the count of the tokeniser, the count of the
+gateway before the change and the count of the gateway now. The last four
+rows are the files of the repository as they were before the change.
+
+| sample | `cl100k_base` | before | now |
+|---|---|---|---|
+| `你好世界，今天天气很好，我们一起去公园散步吧。这是一个测试。` | 33 | 8 | 30 |
+| `こんにちは世界、今日はいい天気ですね。一起去公園に行きましょう。` | 31 | 6 | 32 |
+| `안녕하세요 세계, 오늘 날씨가 좋네요. 같이 공원에 가요.` | 34 | 11 | 25 |
+| `README.md` | 1301 | 1264 | 1297 |
+| `CHANGELOG.md` | 1397 | 1357 | 1375 |
+| `server.py` | 18674 | 17368 | 17488 |
+| `tests/test_server.py` | 23235 | 22865 | 23126 |
+
+A word that no tokeniser holds in one piece is counted as one token, while a
+real tokeniser splits it into several. No rule of that kind can be had without
+the vocabulary of the model, so the count stays an estimate.
+
 ## Tool Calling
 
 1min.ai models do not consistently return native OpenAI `tool_calls`.

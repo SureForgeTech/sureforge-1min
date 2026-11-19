@@ -2737,6 +2737,102 @@ def test_the_token_count_does_not_depend_on_where_the_text_was_split():
     assert whole.total() == split.total()
 
 
+def test_the_token_count_gives_a_character_of_the_chinese_writing_its_own_token():
+    """A character of the Chinese writing is a token of its own."""
+    assert server.token_count("你好") == 2
+    assert server.token_count("你好，世界") == 5
+    assert server.token_count("こんにちは") == 5
+    assert server.token_count("안녕하세요") == 5
+
+
+def test_the_token_count_counts_the_digits_in_groups_of_three():
+    """A run of digits is counted in groups of three, as a tokeniser does."""
+    assert server.token_count("42") == 1
+    assert server.token_count("1234567890") == 4
+    assert server.token_count("a 123 b") == 3
+
+
+def test_the_token_count_counts_a_radical_apart_from_a_word():
+    """A radical of the Chinese writing is counted apart from a word."""
+    # A radical is a mark rather than a word character, and is counted one by
+    # one all the same.
+    assert server.token_count("\u2e80abc") == 2
+    assert server.token_count("\u2f00abc") == 2
+    assert server.token_count("\u4e00abc") == 2
+    assert server.token_count("\u2e80\u4e00") == 2
+
+
+def test_the_token_count_gives_the_jamo_and_the_later_ideographs_a_token():
+    """The jamo and the ideographs of the later extensions are tokens."""
+    assert server.token_count("\u1100\u1101\u1102") == 3
+    assert server.token_count("\ua960\ua961") == 2
+    assert server.token_count("\ud7b0\ud7b1") == 2
+    assert server.token_count("\U0001b000\U0001b001") == 2
+    assert server.token_count("\U0001b132\U0001b150") == 2
+    assert server.token_count("\U00030000\U00030001") == 2
+    assert server.token_count("\U00031350\U00031351") == 2
+
+
+def test_the_token_count_gives_every_block_of_those_writings_a_token():
+    """A word character of every block of those writings is a token."""
+    # One character of every block, so that no block can be dropped.
+    for character in (
+        "\u1100",  # hangul jamo
+        "\U0002f800",  # CJK compatibility ideographs supplement
+        "\u3005",  # CJK symbols and punctuation
+        "\u3041",  # hiragana
+        "\u30a1",  # katakana
+        "\u3105",  # bopomofo
+        "\u3131",  # hangul compatibility jamo
+        "\u3192",  # kanbun
+        "\u31a0",  # bopomofo extended
+        "\u31f0",  # katakana phonetic extensions
+        "\u3220",  # enclosed CJK letters and months
+        "\u3400",  # CJK unified ideographs extension A
+        "\u4e00",  # CJK unified ideographs
+        "\ua960",  # hangul jamo extended A
+        "\uac00",  # hangul syllables
+        "\ud7b0",  # hangul jamo extended B
+        "\uf900",  # CJK compatibility ideographs
+        "\uff66",  # halfwidth katakana
+        "\uffa0",  # halfwidth hangul
+        "\U00016fe0",  # ideographic symbols and punctuation
+        "\U0001aff0",  # kana extended B
+        "\U0001b000",  # kana supplement
+        "\U0001b100",  # kana extended A
+        "\U0001b132",  # small kana extension
+        "\U00020000",  # CJK unified ideographs extension B and later
+    ):
+        # The character is counted apart from the word next to it.
+        assert server.token_count(character + "abc") == 2, hex(ord(character))
+
+
+def test_the_token_count_counts_the_digits_of_every_script():
+    """The digits of another script are counted as well."""
+    assert server.token_count("２０２４") == 2
+    assert server.token_count("١٢٣٤") == 2
+    assert server.token_count("2024") == 2
+    # A date written with the fullwidth digits counts like the same date.
+    assert server.token_count("２０２４年１２月５日") == server.token_count(
+        "2024年12月5日"
+    )
+
+
+def test_the_token_count_of_a_mixed_text_counts_both_writings():
+    """A text that mixes the writings counts each of them its own way."""
+    assert server.token_count("Hello 世界, 123 items!") == 7
+
+
+def test_the_token_count_does_not_depend_on_where_a_foreign_text_was_split():
+    """The count of a foreign text does not depend on where it was split."""
+    text = "你好，世界！123 items, 안녕하세요"
+    for cut in range(len(text) + 1):
+        counter = server._TokenCounter()
+        counter.add(text[:cut])
+        counter.add(text[cut:])
+        assert counter.total() == server.token_count(text), cut
+
+
 def test_the_usage_wrapper_closes_the_chunks_it_wraps():
     """The chunks are closed with the wrapper, so the upstream is released."""
     closed = []

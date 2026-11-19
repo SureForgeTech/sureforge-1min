@@ -1752,8 +1752,48 @@ def extract_result_text(data: dict[str, Any]) -> str | None:
     return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
 
 
-# The pieces a token is made of: a word, a number, or a mark of punctuation.
-_TOKEN_PIECE = re.compile(r"\w+|[^\w\s]")
+# The blocks of the Chinese, Japanese and Korean writing. A run of their
+# characters is counted one by one, because a word of them is not one token
+# and the count of such a run is otherwise far too small. Every word
+# character of those blocks is in the class; the blocks are listed whole, so
+# that the few marks inside them that are not word characters are in it too,
+# and they are counted one by one all the same.
+_CJK_CHARACTERS = (
+    "\u1100-\u11ff"  # hangul jamo
+    "\U0002f800-\U0002fa1f"  # CJK compatibility ideographs supplement
+    "\u3000-\u303f"  # CJK symbols and punctuation
+    "\u3040-\u309f"  # hiragana
+    "\u30a0-\u30ff"  # katakana
+    "\u3100-\u312f"  # bopomofo
+    "\u3130-\u318f"  # hangul compatibility jamo
+    "\u3190-\u319f"  # kanbun
+    "\u31a0-\u31bf"  # bopomofo extended
+    "\u31f0-\u31ff"  # katakana phonetic extensions
+    "\u3200-\u32ff"  # enclosed CJK letters and months
+    "\u3400-\u4dbf"  # CJK unified ideographs extension A
+    "\u4e00-\u9fff"  # CJK unified ideographs
+    "\ua960-\ua97f"  # hangul jamo extended A
+    "\uac00-\ud7af"  # hangul syllables
+    "\ud7b0-\ud7ff"  # hangul jamo extended B
+    "\uf900-\ufaff"  # CJK compatibility ideographs
+    "\uff66-\uff9f"  # halfwidth katakana
+    "\uffa0-\uffdc"  # halfwidth hangul
+    "\U00016fe0-\U00016fe4"  # ideographic symbols and punctuation
+    "\U0001aff0-\U0001afff"  # kana extended B
+    "\U0001b000-\U0001b0ff"  # kana supplement
+    "\U0001b100-\U0001b12f"  # kana extended A
+    "\U0001b130-\U0001b16f"  # small kana extension
+    "\U00020000-\U000323af"  # CJK unified ideographs extension B and later
+)
+# The pieces a token is made of: a character of its own, a group of digits, a
+# word, or a mark of punctuation. The digits are counted in groups of up to
+# three, because that is how a tokeniser of a model provider splits them.
+_TOKEN_PIECE = re.compile(
+    "[" + _CJK_CHARACTERS + "]"  # a character a tokeniser gives a token of its own
+    r"|\d{1,3}"  # a group of digits
+    "|[^\\W\\d" + _CJK_CHARACTERS + "]+"  # a word
+    "|[^\\w\\s]"  # a mark of punctuation
+)
 # The longest piece that is carried from one piece of text to the next. A
 # longer one is counted as it is, so that the buffer stays bounded. It is far
 # longer than any word a model writes.
@@ -1867,10 +1907,12 @@ def _chunk_parts(chunk: str) -> tuple[str, str, str, int]:
 def token_count(text: str) -> int:
     """Count the tokens of a text.
 
-    A word, a number and a mark of punctuation are each one token, which is
-    close to what the tokenisers of the model providers produce. The count
-    needs no model file and no network, so it is the same in every
-    deployment.
+    A word, a group of up to three digits and a mark of punctuation are each
+    one token, and a character of the Chinese, Japanese or Korean writing is
+    counted on its own, because a run of those characters is not one token.
+    This is an estimate: it needs no model file and no network, so the count
+    is the same in every deployment, and it is close to what the tokenisers of
+    the model providers produce.
 
     Args:
         text: Core input string.
@@ -1885,7 +1927,13 @@ class _TokenCounter:
     """Count the tokens of a text that arrives in pieces.
 
     A word that was cut in half by the end of a piece is counted with the next
-    piece, so the count does not depend on where the text was split.
+    piece, so the count does not depend on where the text was split. The same
+    holds for a run of digits and for a run of characters of the Chinese,
+    Japanese or Korean writing, as long as the run is no longer than
+    ``MAX_TOKEN_LENGTH``; a longer one is counted as it is, so that the buffer
+    stays bounded. A word longer than that breaks the count the same way, and
+    a run of digits longer than that breaks it when the cut falls between two
+    groups of up to three.
     """
 
     def __init__(self) -> None:
