@@ -1743,15 +1743,18 @@ def extract_result_text(data: dict[str, Any]) -> str | None:
 # the word characters of the Chinese, Japanese and Korean writing. A run of
 # them is counted one by one, because a word of them is not one token. The
 # marks of those writings -- the radicals, the strokes -- are not word
-# characters and are counted one by one anyway, so they are not listed here.
+# characters and are counted one by one anyway, so they are not listed here,
+# and neither are the few marks inside the blocks below that change no count.
 _CJK_CHARACTERS = (
     "\u1100-\u11ff"  # hangul jamo
     "\u3005-\u3007"  # the iteration mark and the ideographic zero
+    "\u3021-\u3029"  # the Hangzhou numerals
+    "\u3031-\u303c"  # the vertical marks of the Japanese writing
     "\u3040-\u309f"  # hiragana
     "\u30a0-\u30ff"  # katakana
     "\u3105-\u312f"  # bopomofo
     "\u3130-\u318f"  # hangul compatibility jamo
-    "\u31a0-\u31bf"  # bopomofo extensions
+    "\u31a0-\u31bf"  # bopomofo extended
     "\u31f0-\u31ff"  # katakana phonetic extensions
     "\u3400-\u4dbf"  # CJK unified ideographs extension A
     "\u4e00-\u9fff"  # CJK unified ideographs
@@ -1760,10 +1763,13 @@ _CJK_CHARACTERS = (
     "\ud7b0-\ud7ff"  # hangul jamo extended B
     "\uf900-\ufaff"  # CJK compatibility ideographs
     "\uff66-\uff9f"  # halfwidth katakana
+    "\uffa0-\uffdc"  # halfwidth hangul
+    "\U00016fe0-\U00016fe3"  # the iteration marks of the older Chinese writing
     "\U0001aff0-\U0001afff"  # kana extended B
     "\U0001b000-\U0001b0ff"  # kana supplement
     "\U0001b100-\U0001b12f"  # kana extended A
-    "\U00020000-\U000323af"  # CJK unified ideographs extension B and later
+    "\U0001b130-\U0001b16f"  # small kana extension
+    "\U00020000-\U000323af"  # CJK unified ideographs extension B and later, with the compatibility ideographs supplement
 )
 # The pieces a token is made of: a character of its own, a group of digits, a
 # word, or a mark of punctuation. The digits are counted in groups of three,
@@ -1911,7 +1917,7 @@ class _TokenCounter:
     holds for a run of digits and for a run of characters of the Chinese,
     Japanese or Korean writing, as long as the run is no longer than
     ``MAX_TOKEN_LENGTH``; a longer one is counted as it is, so that the buffer
-    stays bounded.
+    stays bounded. A word longer than that breaks the count the same way.
     """
 
     def __init__(self) -> None:

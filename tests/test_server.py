@@ -2730,8 +2730,24 @@ def test_the_token_count_gives_the_jamo_and_the_later_ideographs_a_token():
     assert server.token_count("\ua960\ua961") == 2
     assert server.token_count("\ud7b0\ud7b1") == 2
     assert server.token_count("\U0001b000\U0001b001") == 2
+    assert server.token_count("\U0001b132\U0001b150") == 2
     assert server.token_count("\U00030000\U00030001") == 2
     assert server.token_count("\U00031350\U00031351") == 2
+
+
+def test_the_token_count_gives_the_other_writings_a_token():
+    """The other blocks of those writings are tokens as well."""
+    # The bopomofo, the compatibility ideographs and the halfwidth forms.
+    assert server.token_count("\u3105\u3106") == 2
+    assert server.token_count("\uf900\uf901") == 2
+    assert server.token_count("\uff66\uff67") == 2
+    assert server.token_count("\uffa0\uffa1\uffa2\uffa3") == 4
+    # The Hangzhou numerals and the vertical marks of the Japanese writing.
+    assert server.token_count("\u3021\u3022") == 2
+    assert server.token_count("\u3038\u3039") == 2
+    assert server.token_count("\u303c\u303b") == 2
+    # The iteration marks of the older Chinese writing.
+    assert server.token_count("\U00016fe0\U00016fe1") == 2
 
 
 def test_the_token_count_counts_the_digits_of_every_script():
