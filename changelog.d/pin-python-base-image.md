@@ -1,0 +1,1 @@
+- [SECURITY] Pin the Python container base to the same multi-architecture image digest for reproducible builds.
