@@ -5,9 +5,12 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-COPY pyproject.toml server.py /app/
+COPY requirements-container.txt /app/
+RUN pip install --no-cache-dir --require-hashes --only-binary=:all: -r requirements-container.txt
 
-RUN pip install --no-cache-dir . \
+COPY pyproject.toml README.md server.py /app/
+RUN --network=none pip install --no-cache-dir --no-deps --no-build-isolation --check-build-dependencies . \
+    && pip check \
     && useradd --create-home --shell /usr/sbin/nologin appuser
 
 USER appuser
