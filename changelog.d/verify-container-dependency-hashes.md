@@ -1,0 +1,1 @@
+- [SECURITY] Verify Python dependency hashes in the container build and build the local package offline.

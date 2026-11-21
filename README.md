@@ -143,3 +143,13 @@ guarantee of native tool calling support from every model.
 Pushes to `main` publish `ghcr.io/abd-enterprises/one-min-ai-gateway:latest`
 and a `sha-<commit>` tag; pushing a `v*` tag also publishes `X.Y.Z` and `X.Y`
 tags. Images are built for `linux/amd64` and `linux/arm64`.
+
+The image verifies build and runtime dependency hashes from
+`requirements-container.txt`, then builds the local package offline.
+To refresh the lock after a dependency change, run from the repository root:
+
+```sh
+python3.12 -c 'import tomllib; print(*tomllib.load(open("pyproject.toml", "rb"))["build-system"]["requires"], sep="\n")' | \
+  uv pip compile pyproject.toml - --generate-hashes --python-version 3.12 --only-binary :all: \
+    --no-header --default-index https://pypi.org/simple -o requirements-container.txt
+```
